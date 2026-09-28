@@ -466,6 +466,12 @@ class HHBot:
             return
 
         key = self.pending_input.pop(chat_id, None)
+        if key and key.startswith("reply:"):
+            # Свой ответ работодателю в чат hh
+            hh_chat_id = key.removeprefix("reply:")
+            self.api.send_message(chat_id, "⏳ Отправляю…")
+            self.api.send_message(chat_id, self.send_owner_answer(hh_chat_id, text))
+            return
         if key:
             reply = self.apply_input(key, text)
             self.api.send_message(chat_id, reply)
@@ -1004,6 +1010,26 @@ class HHBot:
             self.show(chat_id, message_id, "settings")
         elif action == "log":
             self.send_log(chat_id, arg)
+        elif action == "ans":
+            hh_chat_id, _, index = arg.partition(":")
+            options = self.state.get("answers").get(hh_chat_id) or []
+            if not index.isdigit() or int(index) >= len(options):
+                answer = "Этот вопрос уже закрыт"
+            else:
+                text = options[int(index)]
+                self.api.answer_callback(query["id"], "Отправляю…")
+
+                def _send() -> None:
+                    self.api.send_message(chat_id, self.send_owner_answer(hh_chat_id, text))
+
+                self._background(_send)
+                return
+        elif action == "ansin":
+            self.pending_input[chat_id] = f"reply:{arg}"
+            self.api.send_message(
+                chat_id,
+                "✍️ Напишите ответ работодателю — отправлю его в чат hh как есть.\n/cancel — отмена",
+            )
         elif action == "logfile":
             path = (
                 self.config_path / LOG_FILENAME
@@ -1382,10 +1408,46 @@ class HHBot:
             # Обычные ответы видны в 📜 Логи; уведомляем только когда нужен владелец
             if not head.startswith("🙋"):
                 continue
-            self.notify(
-                f"<b>{esc(head)}</b>\n{esc(body.strip()[:3500])}"
-                "\n\n👉 Ответьте работодателю сами — бот перевёл разговор в Telegram."
+            fields = dict(
+                line.split(": ", 1)
+                for line in body.splitlines()
+                if line.startswith(("Чат: ", "Кнопки: "))
             )
+            chat_id = fields.get("Чат", "").strip()
+            options = [
+                o.strip() for o in fields.get("Кнопки", "").split(" | ") if o.strip()
+            ]
+            visible = "\n".join(
+                line
+                for line in body.splitlines()
+                if not line.startswith(("Чат: ", "Кнопки: "))
+            ).strip()
+            rows = []
+            if chat_id.isdigit():
+                self.state.set("answers", chat_id, options)
+                rows = [
+                    [button(o[:40], f"ans:{chat_id}:{i}") for i, o in enumerate(options[:4])],
+                    [button("✍️ Ответить самому", f"ansin:{chat_id}")],
+                ]
+            hint = (
+                "\n\n👉 Робот ждёт ответа кнопкой — выберите вариант, бот отправит его в чат."
+                if options
+                else "\n\n👉 Бот перевёл разговор в Telegram. Можно ответить в чат hh прямо отсюда."
+            )
+            self.notify(
+                f"<b>{esc(head)}</b>\n{esc(visible[:3500])}{hint}",
+                markup=keyboard(*rows) if rows else None,
+            )
+
+    def send_owner_answer(self, hh_chat_id: str, text: str) -> str:
+        """Отправляет ответ владельца в чат hh через автоответчик."""
+        code, out, err = self.runner.run_sync(
+            ["autoresponder", "--send-chat", hh_chat_id, f"--text={text}"]
+        )
+        if code == 0:
+            self.state.set("answers", hh_chat_id, None)
+            return f"✅ Отправлено в чат hh: «{esc(text[:300])}»"
+        return "❌ Не удалось отправить:\n<pre>" + esc((err or out)[-800:]) + "</pre>"
 
     def tick(self, now: float | None = None) -> None:
         now = now or time.time()

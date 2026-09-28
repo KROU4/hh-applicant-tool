@@ -568,7 +568,7 @@ def test_chat_events_are_forwarded_once(bot):
     texts = [t for _, t, _ in bot.api.sent]
     # Обычные ответы не пересылаются — только где нужно решение владельца
     assert len(texts) == 1
-    assert texts[0].startswith("<b>🙋 Нужно ваше решение") and "Ответьте работодателю сами" in texts[0]
+    assert texts[0].startswith("<b>🙋 Нужно ваше решение") and "ответить в чат hh" in texts[0]
     assert "Какая зарплата?" in texts[0]
 
 
@@ -615,3 +615,35 @@ def test_start_sends_welcome_photo_once_then_by_file_id(bot):
     assert second[1] == "big-id"
     # После приветствия — панель управления
     assert "HH панель управления" in bot.api.sent[-1][1]
+
+
+def test_owner_answers_robot_button_from_telegram(bot):
+    log = bot.runner.logs_dir / "autoresponder.log"
+    log.write_text("", encoding="utf-8")
+    bot.forward_chat_events()
+    with log.open("a", encoding="utf-8") as fp:
+        fp.write(
+            "🙋 Нужно ваше решение: «AI-разработчик» — Инфогород\n"
+            "https://hh.ru/vacancy/1\n"
+            "Работодатель (Робот-рекрутер): Готовы ли к офисному формату?\n"
+            "Ответ: не отправлен — выберите вариант\n"
+            "Чат: 5666562040\nКнопки: да | нет\n=== конец ===\n"
+        )
+    bot.forward_chat_events()
+    _, text, markup = bot.api.sent[-1]
+    assert "Чат:" not in text and "Робот ждёт ответа кнопкой" in text
+    buttons = markup["inline_keyboard"]
+    assert [b["callback_data"] for b in buttons[0]] == ["ans:5666562040:0", "ans:5666562040:1"]
+
+    bot.runner.sync_result = (0, "Отправлено", "")
+    calls = []
+    bot.runner.run_sync = lambda args, timeout=90: calls.append(args) or (0, "ok", "")
+    bot._background = lambda fn: fn()
+    bot.handle_update(callback("ans:5666562040:1"))
+    assert calls[-1] == ["autoresponder", "--send-chat", "5666562040", "--text=нет"]
+    assert "Отправлено в чат hh" in bot.api.sent[-1][1]
+
+    # Свой ответ текстом
+    bot.handle_update(callback("ansin:5666562040"))
+    bot.handle_update(message("Готов обсудить гибрид"))
+    assert calls[-1][-1] == "--text=Готов обсудить гибрид"

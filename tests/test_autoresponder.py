@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import tempfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -58,6 +60,7 @@ def make_operation(**args) -> Operation:
     op.args = SimpleNamespace(**{**defaults, **args})
     op._full_resumes = {}
     op.__dict__["chatik_url"] = "https://chatik.hh.ru"
+    op.tool.config_path = Path(tempfile.mkdtemp())
     return op
 
 
@@ -242,3 +245,57 @@ def test_pick_option():
     assert pick_option("Да, есть.", ["да", "нет"]) == "да"
     assert pick_option("нет", ["да", "нет"]) == "нет"
     assert pick_option("Скорее всего", ["Готов", "Не готов"]) == "Готов"
+
+
+def test_human_button_question_waits_for_owner_once(capsys):
+    op = make_operation()
+    chat = op.parse_chat_item(chat_item(12, is_bot=True), VACANCIES, {}, RESUMES[1])
+    office = {
+        "id": 777,
+        "participantId": "90236278",
+        "text": "Готовы ли к офисному формату м. Курская?",
+        "participantDisplay": {"isBot": True, "name": "Робот-рекрутер"},
+        "actions": {"text_buttons": [{"text": "да"}, {"text": "нет"}]},
+    }
+    _robot_chat(op, [office])
+    ai = op.tool.get_cover_letter_ai.return_value
+    ai.complete.return_value = "[НУЖЕН_ЧЕЛОВЕК] Формат обсудим в Telegram"
+
+    op.reply_to_chat(chat)
+    op.reply_to_chat(chat)  # следующая проверка — сообщение уже разобрано
+
+    op._post.assert_not_called()
+    assert ai.complete.call_count == 1
+    out = capsys.readouterr().out
+    assert out.count("🙋 Нужно ваше решение") == 1
+    assert "Чат: 12" in out and "Кнопки: да | нет" in out
+
+
+def test_no_reply_is_remembered():
+    op = make_operation()
+    chat = op.parse_chat_item(chat_item(13), VACANCIES, {}, RESUMES[1])
+    _robot_chat(op, [{"id": 5, "participantId": EMPLOYER, "text": "Спасибо, передам ответы"}])
+    ai = op.tool.get_cover_letter_ai.return_value
+    ai.complete.return_value = "[БЕЗ_ОТВЕТА]"
+    op.reply_to_chat(chat)
+    op.reply_to_chat(chat)
+    assert ai.complete.call_count == 1
+
+
+def test_markdown_is_stripped_from_chat_reply():
+    op = make_operation()
+    chat = op.parse_chat_item(chat_item(14), VACANCIES, {}, RESUMES[1])
+    _robot_chat(op, [{"participantId": EMPLOYER, "text": "Расскажите про PyTorch"}])
+    op.tool.get_cover_letter_ai.return_value.complete.return_value = "**PyTorch:** 3+ года"
+    op.reply_to_chat(chat)
+    assert op._post.call_args.args[1]["text"] == "PyTorch: 3+ года"
+
+
+def test_send_chat_mode_sends_one_message():
+    op = make_operation()
+    op._post = MagicMock(return_value={})
+    op.tool.config_path = Path(tempfile.mkdtemp())
+    args = SimpleNamespace(**{**vars(op.args), "send_chat": 42, "text": "да"})
+    op.run(op.tool, args)
+    path, body, _ = op._post.call_args.args
+    assert path == "/chatik/api/send" and body["chatId"] == 42 and body["text"] == "да"

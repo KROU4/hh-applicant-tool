@@ -52,6 +52,8 @@ DEFAULTS: dict[str, Any] = {
         "timezone": "Europe/Moscow",
     },
     "runs": {},
+    # Варианты ответа кнопками по чатам hh, ждущим решения владельца
+    "answers": {},
 }
 
 

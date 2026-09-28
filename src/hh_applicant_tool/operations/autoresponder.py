@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import cached_property
+from pathlib import Path
 from threading import Event
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +37,8 @@ HUMAN_MARKER = "[НУЖЕН_ЧЕЛОВЕК]"
 NO_REPLY_MARKER = "[БЕЗ_ОТВЕТА]"
 # Робот, повторяющий один вопрос, ждёт другого ответа — не зацикливаемся
 MAX_SAME_QUESTION = 3
+# Последнее разобранное сообщение по каждому чату
+HANDLED_FILENAME = "autoresponder_handled.json"
 # Конец блока события в выводе (его разбирает Telegram-бот)
 EVENT_END = "=== конец ==="
 
@@ -61,6 +65,8 @@ class Namespace(BaseNamespace):
     contact: str | None
     dry_run: bool
     once: bool
+    send_chat: int | None
+    text: str | None
 
 
 class Operation(BaseOperation):
@@ -100,12 +106,29 @@ class Operation(BaseOperation):
             action="store_true",
             help="Одна проверка и выход",
         )
+        parser.add_argument(
+            "--send-chat",
+            type=int,
+            help="Отправить одно сообщение (--text) в этот чат и выйти",
+        )
+        parser.add_argument("--text", help="Текст для --send-chat")
 
     def run(self, tool: HHApplicantTool, args: Namespace) -> None:
         self.tool = tool
         self.args = args
         self._full_resumes: dict[str, dict[str, Any]] = {}
         cancel_event = getattr(args, "_cancel_event", None) or Event()
+
+        if args.send_chat:
+            # Ответ владельца из Telegram-бота
+            if not (args.text or "").strip():
+                logger.error("Нужен --text")
+                return 1
+            self.send_message(args.send_chat, args.text.strip())
+            print(f"Отправлено в чат {args.send_chat}")
+            tool.save_token()
+            tool.save_cookies()
+            return None
 
         logger.info("Автоответчик запущен")
         while not cancel_event.is_set():
@@ -311,6 +334,9 @@ class Operation(BaseOperation):
             logger.debug("Чат %s пропущен: уже %d сообщений", chat.chat_id, len(messages))
             return
         last = messages[-1]
+        if self.is_handled(chat.chat_id, last.get("id")):
+            # Уже разобрали это сообщение (ждёт владельца / ответ не нужен)
+            return
         repeats = sum(1 for m in messages if m.get("text") == last.get("text"))
         if repeats >= MAX_SAME_QUESTION:
             logger.warning(
@@ -318,8 +344,14 @@ class Operation(BaseOperation):
                 chat.chat_id,
                 repeats,
             )
+            # Опрос застрял — зовём владельца один раз, он ответит из Telegram
+            chat.reply_options = get_reply_options(last) or chat.reply_options
+            chat.last_message = last["text"].strip()
+            self.print_event(chat, "", needs_human=True, sent=False)
+            self.mark_handled(chat.chat_id, last.get("id"))
             return
         chat.reply_options = get_reply_options(last) or chat.reply_options
+        chat.last_message = last["text"].strip()
 
         history = "\n---\n".join(
             ("Я" if str(m.get("participantId")) == me else
@@ -333,13 +365,23 @@ class Operation(BaseOperation):
         reply = ai.complete(self.build_user_prompt(chat, history)).strip()
         if NO_REPLY_MARKER in reply:
             logger.debug("Чат %s: ответ не требуется", chat.chat_id)
+            # Иначе каждые пару минут снова спрашивали бы модель
+            self.mark_handled(chat.chat_id, last.get("id"))
             return
         needs_human = HUMAN_MARKER in reply
-        reply = reply.replace(HUMAN_MARKER, "").strip()
+        reply = strip_markdown(reply.replace(HUMAN_MARKER, "")).strip()
         if not reply:
             logger.warning("AI вернул пустой ответ для чата %s", chat.chat_id)
             return
-        if chat.reply_options and not needs_human:
+
+        if needs_human and chat.reply_options:
+            # Робот принимает только кнопку, а выбрать её должен сам соискатель:
+            # ничего не пишем, владелец ответит кнопкой из Telegram
+            self.print_event(chat, "", needs_human=True, sent=False)
+            if not self.args.dry_run:
+                self.mark_handled(chat.chat_id, last.get("id"))
+            return
+        if chat.reply_options:
             # Робот-рекрутер принимает только текст кнопки, иначе переспрашивает
             reply = pick_option(reply, chat.reply_options)
         if needs_human and self.args.contact and self.args.contact not in reply:
@@ -349,17 +391,46 @@ class Operation(BaseOperation):
             self.print_event(chat, reply, needs_human, sent=False)
             return
 
+        self.send_message(chat.chat_id, reply)
+        logger.info("Ответ в чате %s (%s): %s", chat.chat_id, chat.author, reply)
+        self.print_event(chat, reply, needs_human, sent=True)
+
+    def send_message(self, chat_id: int, text: str) -> None:
         self._post(
             "/chatik/api/send",
             {
-                "chatId": chat.chat_id,
-                "text": reply,
+                "chatId": chat_id,
+                "text": text,
                 "idempotencyKey": str(uuid.uuid4()),
             },
             f"{self.chatik_url}/?platform=xhh&dest=iframe",
         )
-        logger.info("Ответ в чате %s (%s): %s", chat.chat_id, chat.author, reply)
-        self.print_event(chat, reply, needs_human, sent=True)
+
+    # ----------------------------------------- уже разобранные сообщения
+
+    @cached_property
+    def _handled_path(self) -> Path:
+        return self.tool.config_path / HANDLED_FILENAME
+
+    def _handled(self) -> dict[str, Any]:
+        try:
+            return json.loads(self._handled_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def is_handled(self, chat_id: int, message_id: Any) -> bool:
+        return message_id is not None and self._handled().get(str(chat_id)) == message_id
+
+    def mark_handled(self, chat_id: int, message_id: Any) -> None:
+        if message_id is None:
+            return
+        data = self._handled()
+        data[str(chat_id)] = message_id
+        # Храним только недавние чаты, файл не должен расти бесконечно
+        data = dict(list(data.items())[-500:])
+        tmp = self._handled_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        tmp.replace(self._handled_path)
 
     @staticmethod
     def print_event(
@@ -367,15 +438,18 @@ class Operation(BaseOperation):
     ) -> None:
         """Блок для Telegram-бота: он пересылает такие события владельцу."""
         head = "🙋 Нужно ваше решение" if needs_human else "💬 Ответил в чате"
-        if not sent:
+        if not sent and reply:
             head += " (тест, не отправлено)"
-        print(
-            f"{head}: «{chat.vacancy_name}» — {chat.company_name}\n"
-            f"{chat.vacancy_url}\n"
-            f"Работодатель ({chat.author or 'HR'}): {chat.last_message}\n"
-            f"Ответ: {reply}\n{EVENT_END}",
-            flush=True,
-        )
+        lines = [
+            f"{head}: «{chat.vacancy_name}» — {chat.company_name}",
+            chat.vacancy_url,
+            f"Работодатель ({chat.author or 'HR'}): {chat.last_message}",
+            f"Ответ: {reply}" if reply else "Ответ: не отправлен — выберите вариант",
+            f"Чат: {chat.chat_id}",
+        ]
+        if chat.reply_options and not reply:
+            lines.append("Кнопки: " + " | ".join(chat.reply_options))
+        print("\n".join(lines) + f"\n{EVENT_END}", flush=True)
 
     def delete_chat(self, chat: ChatToReply) -> None:
         if self.args.dry_run:
@@ -481,6 +555,12 @@ def get_reply_options(message: dict[str, Any]) -> list[str]:
         if text:
             result.append(text)
     return result
+
+
+def strip_markdown(text: str) -> str:
+    """Чат hh показывает текст как есть: **жирный** остался бы звёздочками."""
+    text = re.sub(r"(\*\*|__)(.+?)\1", r"\2", text)
+    return re.sub(r"^#{1,6}\s*", "", text, flags=re.M)
 
 
 def pick_option(reply: str, options: list[str]) -> str:
