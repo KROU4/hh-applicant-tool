@@ -109,6 +109,7 @@ INPUT_PROMPTS = {
     "letter": "✉️ Пришлите шаблон письма (используется, когда AI-письма выключены).\n"
     "Подстановки: {vacancy_name}, {employer_name}, {first_name}, {last_name}, {phone}, {email}, {resume_url}.\n"
     "Случайный вариант: {Здравствуйте|Добрый день}.",
+    "letter_contact": "📨 Пришлите контакт, который бот добавит в конец каждого AI-письма (например, <code>https://t.me/username</code>). «-» — не добавлять.",
     "hours": "🕘 Пришлите часы работы автооткликов в формате <code>9-21</code>.",
     "daily_limit": "🎯 Сколько откликов максимум за 24 часа (включая ручные запуски)? У hh.ru потолок 200. «-» — без лимита.",
     "openrouter_key": "🔑 Пришлите ключ OpenRouter (sk-or-...).",
@@ -174,6 +175,8 @@ def build_apply_args(settings: dict[str, Any], letter_path: Path) -> list[str]:
         args += ["--experience", settings["experience"]]
     if settings.get("system_prompt"):
         args.append(f"--system-prompt={settings['system_prompt']}")
+    if settings.get("letter_contact"):
+        args.append(f"--letter-contact={settings['letter_contact']}")
     if settings.get("work_format"):
         args += ["--work-format", *settings["work_format"].split(",")]
     return args
@@ -540,6 +543,7 @@ class HHBot:
             "",
             f"🧠 AI-письма: {on_off(s['use_ai'])}",
             f"✍️ Инструкция AI: {esc(s['system_prompt'][:150]) or 'стандартная'}",
+            f"📨 Контакт в конце письма: {esc(s.get('letter_contact') or '—')}",
             f"✉️ Письмо к каждому отклику: {on_off(s['force_message'])}",
             f"🔎 AI-фильтр вакансий: {AI_FILTER_TITLES.get(s['ai_filter'])}",
             f"📧 Письмо на email работодателя: {on_off(s['send_email'])}",
@@ -578,7 +582,10 @@ class HHBot:
                 button(f"📧 Email {on_off(s['send_email'])}", "flip:send_email"),
                 button(f"🧪 Тест {on_off(s['dry_run'])}", "flip:dry_run"),
             ],
-            [button("✉️ Шаблон письма", "input:letter")],
+            [
+                button("📨 Контакт в письме", "input:letter_contact"),
+                button("✉️ Шаблон письма", "input:letter"),
+            ],
             [button("◀️ Назад", "screen:main")],
         )
         return "\n".join(lines), markup
@@ -934,7 +941,7 @@ class HHBot:
 
     def apply_input(self, key: str, text: str) -> str:
         clear = text in ("-", "—")
-        if key in ("search", "excluded_filter", "system_prompt"):
+        if key in ("search", "excluded_filter", "system_prompt", "letter_contact"):
             if key == "excluded_filter" and not clear:
                 try:
                     re.compile(text)

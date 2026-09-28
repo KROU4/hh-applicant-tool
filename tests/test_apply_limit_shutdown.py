@@ -139,3 +139,49 @@ class TestMaxResponsesAcrossResumes:
 
         assert op.tool.api_client.post.call_count == 5
         assert op.total_applied == 5
+
+
+class TestCoverLetterPrompt:
+    def test_prompt_has_vacancy_and_resume_but_no_contacts(self):
+        op = _make_operation()
+        op.message_prompt = "Напиши письмо."
+        op.letter_contact = "https://t.me/krou4"
+        op._resume_analysis_cache = {}
+        op.api_client.get.side_effect = lambda url, *a, **k: (
+            {
+                "description": "<p>Строить <b>RAG</b> и AI-агентов</p>",
+                "key_skills": [{"name": "LLM"}, {"name": "Python"}],
+            }
+            if url.startswith("/vacancies/")
+            else {
+                "title": "Senior AI Engineer",
+                "skill_set": ["RAG", "FastAPI"],
+                "experience": [
+                    {"company": "Хэппи ИИ", "position": "AI Engineer",
+                     "start": "2024-01-01", "description": "LLM-оркестрация"}
+                ],
+            }
+        )
+        placeholders = {
+            "vacancy_name": "AI Engineer", "employer_name": "Лайфтех",
+            "resume_title": "Senior AI Engineer", "resume_url": "https://hh.ru/resume/x",
+            "first_name": "Дмитрий", "last_name": "В", "phone": "375000", "email": "a@b.c",
+        }
+        prompt = op._build_cover_letter_prompt(
+            {"id": "1", "name": "AI Engineer"}, {"id": "r1"}, placeholders
+        )
+        assert "Строить RAG и AI-агентов" in prompt
+        assert "Ключевые навыки: LLM, Python" in prompt
+        assert "Хэппи ИИ" in prompt and "LLM-оркестрация" in prompt
+        assert "https://t.me/krou4" in prompt
+        for secret in ("375000", "a@b.c", "https://hh.ru/resume/x"):
+            assert secret not in prompt
+
+    def test_contact_is_appended_when_model_forgets_it(self):
+        op = _make_operation()
+        op.letter_contact = "https://t.me/krou4"
+        assert op._finalize_letter("Добрый день! Текст.").endswith(
+            "Жду обратной связи в Telegram: https://t.me/krou4"
+        )
+        kept = "Добрый день! Пишите: https://t.me/krou4"
+        assert op._finalize_letter(kept) == kept

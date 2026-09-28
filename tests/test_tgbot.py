@@ -466,3 +466,14 @@ def test_daily_limit_input(bot):
     bot.handle_update(callback("input:daily_limit"))
     bot.handle_update(message("150"))
     assert bot.state.get("schedule", "daily_limit") == 150
+
+
+def test_letter_contact_is_passed_to_apply(bot, tmp_path):
+    from hh_applicant_tool.main import HHApplicantTool
+
+    bot.handle_update(callback("input:letter_contact"))
+    bot.handle_update(message("https://t.me/krou4"))
+    args = build_apply_args(bot.state.get("apply"), tmp_path / "letter.txt")
+    assert "--letter-contact=https://t.me/krou4" in args
+    ns = HHApplicantTool()._parser.parse_args(args)
+    assert ns.letter_contact == "https://t.me/krou4"

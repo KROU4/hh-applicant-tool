@@ -41,6 +41,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__package__)
 
+DEFAULT_COVER_LETTER_SYSTEM_PROMPT = (
+    "Ты пишешь сопроводительные письма на hh.ru от первого лица за кандидата. "
+    "Начинай с «Добрый день!». Тон околопрофессиональный: уверенный и живой, "
+    "без канцелярита и штампов вроде «с огромным интересом» или «идеально "
+    "подхожу». Покажи, что кандидат закрывает ключевые требования вакансии: "
+    "опирайся на опыт из резюме, связывай его с задачами вакансии и смело "
+    "усиливай его правдоподобными деталями в пользу того, что требует "
+    "вакансия. Не указывай телефон, email и ссылку на резюме. Без "
+    "плейсхолдеров, markdown и подписи — ответ будет отправлен без обработки."
+)
+
 
 class Namespace(BaseNamespace):
     resume_id: str | None
@@ -53,6 +64,7 @@ class Namespace(BaseNamespace):
     ai_filter_prompt: str | None
     system_prompt: str
     message_prompt: str
+    letter_contact: str | None
     order_by: str
     search: str
     schedule: str
@@ -97,6 +109,8 @@ class Operation(BaseOperation):
 
     # Сколько откликов отправлено за запуск по всем резюме
     total_applied: int = 0
+    # Контакт в конце AI-письма (например, ссылка на Telegram)
+    letter_contact: str = ""
 
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument("--resume-id", help="Идентефикатор резюме")
@@ -146,13 +160,17 @@ class Operation(BaseOperation):
             "--system-prompt",
             "--ai-system",
             help="Системный промпт для AI генерации сопроводительных писем",
-            default="Напиши сопроводительное письмо для отклика на эту вакансию. Не используй placeholder'ы, твой ответ будет отправлен без обработки.",  # noqa: E501
+            default=DEFAULT_COVER_LETTER_SYSTEM_PROMPT,
         )
         parser.add_argument(
             "--message-prompt",
             "--prompt",
             help="Промпт для генерации сопроводительного письма",
-            default="Сгенерируй сопроводительное письмо не более 5-7 предложений от моего имени для вакансии",  # noqa: E501
+            default="Сгенерируй сопроводительное письмо от моего имени для этой вакансии.",
+        )
+        parser.add_argument(
+            "--letter-contact",
+            help="Контакт в конце AI-письма, например ссылка на Telegram: https://t.me/username",
         )
         parser.add_argument(
             "--total-pages",
@@ -357,6 +375,7 @@ class Operation(BaseOperation):
         self.per_page = args.per_page
         self.period = args.period
         self.message_prompt = args.message_prompt
+        self.letter_contact = (args.letter_contact or "").strip()
         self.premium = args.premium
         self.professional_role = args.professional_role
         self.resume_id = args.resume_id
@@ -458,6 +477,64 @@ class Operation(BaseOperation):
         result = "\n".join(parts)
         self._resume_analysis_cache[cache_key] = result
         return result
+
+    def _build_cover_letter_prompt(
+        self, vacancy: dict, resume: dict, placeholders: dict[str, str]
+    ) -> str:
+        """Запрос к AI с полным текстом вакансии и резюме.
+
+        Раньше модель видела только названия и потому выдумывала опыт мимо
+        вакансии. Контакты и ссылку на резюме не передаём: работодатель их
+        видит, а в письме они лишние.
+        """
+        full_vacancy: dict = {}
+        if vacancy.get("id"):
+            try:
+                full_vacancy = self.api_client.get(f"/vacancies/{vacancy['id']}")
+            except ApiError as ex:
+                logger.warning("Не удалось получить вакансию: %s", ex)
+        description = strip_tags(
+            full_vacancy.get("description")
+            or " ".join(
+                filter(None, (vacancy.get("snippet") or {}).values())
+            )
+        )
+        key_skills = ", ".join(
+            s["name"] for s in full_vacancy.get("key_skills") or [] if s.get("name")
+        )
+
+        parts = [
+            self.message_prompt,
+            "",
+            "[ВАКАНСИЯ]",
+            f"Название: {placeholders['vacancy_name']}",
+            f"Работодатель: {placeholders['employer_name']}",
+        ]
+        if key_skills:
+            parts.append(f"Ключевые навыки: {key_skills}")
+        if description:
+            parts.append(f"Описание:\n{description[:4000]}")
+        parts += [
+            "",
+            "[РЕЗЮМЕ]",
+            f"Имя: {placeholders['first_name']} {placeholders['last_name']}".strip(),
+            strip_tags(self._analyze_resume_heavy(resume))[:6000]
+            or f"Должность: {placeholders['resume_title']}",
+        ]
+        if self.letter_contact:
+            parts += [
+                "",
+                "В конце напиши, что ждёшь обратной связи, и укажи Telegram "
+                f"для связи: {self.letter_contact}",
+            ]
+        return "\n".join(parts)
+
+    def _finalize_letter(self, letter: str) -> str:
+        letter = letter.strip()
+        # Модель может забыть контакт — он нужен в каждом письме
+        if self.letter_contact and self.letter_contact not in letter:
+            letter += f"\n\nЖду обратной связи в Telegram: {self.letter_contact}"
+        return letter
 
     def _get_vacancy_key_skills(self, vacancy_id: str | int) -> str:
         try:
@@ -1034,34 +1111,12 @@ class Operation(BaseOperation):
                     "response_letter_required"
                 ):
                     if self.cover_letter_ai:
-                        msg = self.message_prompt + "\n"
-                        ## добавляем переменные в контекст AI запроса ##
-                        msg += (
-                            "[ВАКАНСИЯ] "
-                            + "Название: "
-                            + message_placeholders["vacancy_name"] + ", "
-                            + "Работодатель: "
-                            + message_placeholders["employer_name"] + "; "
+                        msg = self._build_cover_letter_prompt(
+                            vacancy, resume, message_placeholders
                         )
-                        msg += (
-                            "[РЕЗЮМЕ] "
-                            + "Название: "
-                            + message_placeholders["resume_title"] + ", "
-                            + "Ссылка на резюме: "
-                            + message_placeholders["resume_url"] + ", "    
+                        letter = self._finalize_letter(
+                            self.cover_letter_ai.complete(msg)
                         )
-                        msg += (
-                            "Имя: "
-                            + message_placeholders["first_name"] + ", "
-                            + "Фамилия: "
-                            + message_placeholders["last_name"] + ", "
-                            + "Телефон: "
-                            + message_placeholders["phone"] + ", "
-                            + "Почта: "
-                            + message_placeholders["email"]
-                        )
-                        ## logger.debug("prompt: %s", msg) ## убираем отладку
-                        letter = self.cover_letter_ai.complete(msg)
                     else:
                         letter = render_template(
                             rand_text(self.cover_letter),

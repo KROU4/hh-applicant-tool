@@ -27,6 +27,8 @@ DEFAULTS: dict[str, Any] = {
         "work_format": None,  # None | "REMOTE" | "HYBRID" | "REMOTE,HYBRID"
         "experience": None,
         "system_prompt": "",
+        # Добавляется в конец каждого AI-письма (например, ссылка на Telegram)
+        "letter_contact": "",
         "send_email": False,
     },
     "reply": {
