@@ -58,6 +58,8 @@ class ChatToReply:
     resume: dict[str, Any]
     reply_options: list[str] = field(default_factory=list)
     is_discard: bool = False
+    # Город вакансии: соискатель «находится» в столице её страны
+    vacancy_area: str = ""
 
 
 class Namespace(BaseNamespace):
@@ -306,6 +308,7 @@ class Operation(BaseOperation):
             company_name=company.get("visibleName") or company.get("name") or "",
             vacancy_url=(vacancy.get("links") or {}).get("desktop") or "",
             vacancy_compensation=format_compensation(vacancy.get("compensation")),
+            vacancy_area=(vacancy.get("area") or {}).get("name") or "",
             resume=resumes_by_real_id.get(str(resume_id), default_resume),
             reply_options=get_reply_options(last),
             is_discard=is_discard,
@@ -535,14 +538,15 @@ class Operation(BaseOperation):
         prompt = f"""Вакансия: {chat.vacancy_name}
 Компания: {chat.company_name}
 Зарплата в вакансии: {chat.vacancy_compensation or "не указана"}
+Город вакансии: {chat.vacancy_area or "не указан"}
 Ссылка: {chat.vacancy_url}
 
 История переписки:
 {history}
 
 Правила ответа:
-1. Если предлагают тестовое задание, ответь, что времени на тестовое нет, но готов показать примеры рабочего кода и обсудить опыт на созвоне.
-2. Если предлагают заполнить форму, анкету или Google Docs, ответь, что времени на заполнение нет, и предложи обсудить вопросы в чате или на созвоне.
+1. Решения соискателя важнее правил ниже. Если решения нет: на тестовое задание ответь, что времени на тестовое нет, но готов показать примеры рабочего кода и обсудить опыт на созвоне.
+2. Если решения нет: на просьбу заполнить форму, анкету или Google Docs ответь, что времени на заполнение нет, и предложи обсудить вопросы в чате или на созвоне.
 3. Если вопрос про зарплату, формат работы, график, переезд, дату выхода или время созвона — ответь по решениям соискателя; если решения нет — начни ответ с маркера и предложи обсудить детали лично.
 4. Если сообщение не требует ответа (благодарность, «ответы переданы работодателю», «мы свяжемся с вами», автоматическое уведомление), верни только {NO_REPLY_MARKER}.
 5. Если есть варианты ответа кнопками, верни только текст одной кнопки, без пояснений.

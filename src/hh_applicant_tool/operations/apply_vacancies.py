@@ -540,6 +540,13 @@ class Operation(BaseOperation):
             strip_tags(self._analyze_resume_heavy(resume))[:6000]
             or f"Должность: {placeholders['resume_title']}",
         ]
+        answers = self._candidate_answers()
+        if answers:
+            parts += [
+                "",
+                "[РЕШЕНИЯ КАНДИДАТА] (письмо не должно им противоречить)",
+                answers,
+            ]
         if self.letter_contact:
             parts += [
                 "",
@@ -547,6 +554,15 @@ class Operation(BaseOperation):
                 f"для связи: {self.letter_contact}",
             ]
         return "\n".join(parts)
+
+    def _candidate_answers(self) -> str:
+        """Решения соискателя из «📋 Ответы рекрутерам» Telegram-бота."""
+        try:
+            path = self.tool.config_path / "candidate_answers.txt"
+            text = path.read_text(encoding="utf-8")
+        except (OSError, TypeError, AttributeError):
+            return ""
+        return text.strip()[:3000] if isinstance(text, str) else ""
 
     def _finalize_letter(self, letter: str) -> str:
         # hh показывает письмо как обычный текст: markdown остался бы звёздочками

@@ -324,3 +324,11 @@ def test_candidate_answers_let_bot_answer_office_question_itself():
     system_prompt = op.tool.get_cover_letter_ai.call_args.args[0]
     assert "только удалёнка" in system_prompt and "Решения соискателя" in system_prompt
     assert op._post.call_args.args[1]["text"] == "нет"
+
+
+def test_vacancy_area_is_in_prompt():
+    op = make_operation()
+    vacancies = {"137838539": {**VACANCIES["137838539"], "area": {"name": "Минск"}}}
+    chat = op.parse_chat_item(chat_item(16), vacancies, {}, RESUMES[1])
+    assert chat.vacancy_area == "Минск"
+    assert "Город вакансии: Минск" in op.build_user_prompt(chat, "история")
