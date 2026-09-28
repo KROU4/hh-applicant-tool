@@ -182,6 +182,30 @@ class TelegramAPI:
                 caption=caption,
             )
 
+    def send_photo(
+        self, chat_id: int, photo: Path | str, caption: str | None = None
+    ) -> dict:
+        """Фото из файла или по file_id (повторно без загрузки)."""
+        params = dict(chat_id=chat_id, caption=caption, parse_mode="HTML")
+        if isinstance(photo, Path):
+            with photo.open("rb") as fp:
+                return self.call(
+                    "sendPhoto",
+                    http_timeout=120,
+                    files={"photo": (photo.name, fp)},
+                    **params,
+                )
+        return self.call("sendPhoto", photo=photo, **params)
+
+    def set_profile_photo(self, path: Path) -> None:
+        with path.open("rb") as fp:
+            self.call(
+                "setMyProfilePhoto",
+                http_timeout=120,
+                files={"avatar": (path.name, fp, "image/jpeg")},
+                photo={"type": "static", "photo": "attach://avatar"},
+            )
+
     def download_file(self, file_id: str) -> bytes:
         info = self.call("getFile", file_id=file_id)
         response = self.session.get(self.file_url + info["file_path"], timeout=60)

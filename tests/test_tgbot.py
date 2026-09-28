@@ -23,6 +23,7 @@ class FakeAPI:
         self.answers: list[tuple[str, str | None]] = []
         self.documents: list[Path] = []
         self.files: dict[str, bytes] = {}
+        self.photos: list = []
 
     def send_message(self, chat_id, text, reply_markup=None, *, silent=False):
         self.sent.append((chat_id, text, reply_markup))
@@ -39,6 +40,10 @@ class FakeAPI:
 
     def download_file(self, file_id):
         return self.files[file_id]
+
+    def send_photo(self, chat_id, photo, caption=None):
+        self.photos.append((chat_id, photo, caption))
+        return {"photo": [{"file_id": "small"}, {"file_id": "big-id"}]}
 
 
 class FakeProc:
@@ -599,3 +604,14 @@ def test_failed_apply_run_is_retried_while_quota_left(bot):
     assert bot.state.last_run("apply_next") == pytest.approx(before + 1800, abs=5)
     assert "повторю через 30 мин" in bot.api.sent[-1][1]
     assert "Осталось 156" in bot.api.sent[-1][1]
+
+
+def test_start_sends_welcome_photo_once_then_by_file_id(bot):
+    (bot.config_path / "welcome.jpg").write_bytes(b"jpg")
+    bot.handle_update(message("/start"))
+    bot.handle_update(message("/start"))
+    first, second = bot.api.photos
+    assert isinstance(first[1], Path) and "автопилот откликов" in first[2]
+    assert second[1] == "big-id"
+    # После приветствия — панель управления
+    assert "HH панель управления" in bot.api.sent[-1][1]

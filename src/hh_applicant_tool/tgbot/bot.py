@@ -110,6 +110,16 @@ DRY_RUN_LIMIT = 5
 CHAT_EVENT_END = "=== конец ===".encode()
 CHAT_EVENT_RE = re.compile(r"((?:🙋|💬)[^\n]*\n.*?)\n=== конец ===", re.S)
 
+WELCOME_IMAGE = "welcome.jpg"
+WELCOME_TEXT = (
+    "<b>👋 Привет! Я — автопилот откликов на hh.ru</b>\n\n"
+    "🎯 Нахожу вакансии по вашим ключевым словам\n"
+    "✍️ Пишу AI-письмо под каждую вакансию\n"
+    "🚀 Откликаюсь по расписанию — до 200 раз в сутки\n"
+    "💬 Отвечаю рекрутерам в чатах и зову вас, когда нужно ваше решение\n\n"
+    "Всё управление — кнопками ниже 👇"
+)
+
 INPUT_PROMPTS = {
     "search": "🔍 Пришлите поисковый запрос (например: <code>python разработчик</code>).\nПустой поиск = рекомендованные вакансии. «-» — очистить.",
     "included_filter": "🎯 Пришлите ключевые слова через | (регулярное выражение), например:\n"
@@ -362,6 +372,7 @@ class HHBot:
             self.api.set_commands(
                 [
                     ("menu", "Панель управления"),
+                    ("start", "Приветствие и панель"),
                     ("stop", "Остановить все задачи"),
                     ("log", "Последние строки лога откликов"),
                     ("help", "Справка"),
@@ -469,7 +480,11 @@ class HHBot:
     # -------------------------------------------------------------- commands
 
     def handle_command(self, chat_id: int, command: str) -> None:
-        if command in ("/start", "/menu"):
+        if command == "/start":
+            self.pending_input.pop(chat_id, None)
+            self.send_welcome(chat_id)
+            self.send_screen(chat_id, "main")
+        elif command == "/menu":
             self.pending_input.pop(chat_id, None)
             self.send_screen(chat_id, "main")
         elif command == "/stop":
@@ -490,6 +505,25 @@ class HHBot:
             self.send_screen(chat_id, "main")
         else:
             self.api.send_message(chat_id, self.help_text())
+
+    def send_welcome(self, chat_id: int) -> None:
+        """Картинка с приветствием; после первой загрузки — по file_id."""
+        path = self.config_path / WELCOME_IMAGE
+        file_id = self.state.get("runs").get("welcome_file_id")
+        if not file_id and not path.exists():
+            self.api.send_message(chat_id, WELCOME_TEXT)
+            return
+        try:
+            message = self.api.send_photo(chat_id, file_id or path, WELCOME_TEXT)
+        except TelegramError:
+            if not file_id or not path.exists():
+                self.api.send_message(chat_id, WELCOME_TEXT)
+                return
+            # file_id протух — загружаем файл заново
+            message = self.api.send_photo(chat_id, path, WELCOME_TEXT)
+        photos = message.get("photo") or []
+        if photos:
+            self.state.set("runs", "welcome_file_id", photos[-1]["file_id"])
 
     @staticmethod
     def help_text() -> str:
