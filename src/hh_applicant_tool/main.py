@@ -370,7 +370,11 @@ class HHApplicantTool(MegaTool):
         if self.api_client.access_token != self.config.get("token", {}).get(
             "access_token"
         ):
-            self.config.save(token=self.api_client.get_access_token())
+            token = self.api_client.get_access_token()
+            # Файл перечитываем: его могли изменить параллельные процессы
+            # (Telegram-бот, другие операции), а снимок в памяти устарел
+            utils.Config(self.config_path / CONFIG_FILENAME).save(token=token)
+            self.config["token"] = token
             return True
         return False
 
@@ -409,7 +413,22 @@ class HHApplicantTool(MegaTool):
         
         config_section = config_sections[purpose]
         c = self.config.get(config_section, {})
-        
+
+        openrouter_config = self.config.get("openrouter") or {}
+        if c.get("provider") == "openrouter" or (
+            not c.get("api_key") and openrouter_config.get("api_key")
+        ):
+            # Из секции цели берём только то, что имеет смысл для роутера;
+            # model/base_url/rate_limit там настроены под другого провайдера
+            overrides = {
+                k: c[k]
+                for k in ("models", "temperature", "max_completion_tokens")
+                if c.get(k) not in (None, "", [])
+            }
+            return self._init_openrouter_client(
+                system_prompt, {**openrouter_config, **overrides}
+            )
+
         api_key = c.get("api_key")
         if not api_key:
             raise ValueError(
@@ -457,6 +476,39 @@ class HHApplicantTool(MegaTool):
                 or DEFAULT_OPENAI_CONNECT_TIMEOUT
             ),
             session=self.openai_session,
+        )
+
+    def _init_openrouter_client(
+        self, system_prompt: str, c: dict
+    ) -> ai.ChatOpenRouter:
+        """Роутер по бесплатным моделям OpenRouter (секция `openrouter`)."""
+        if not c.get("api_key"):
+            raise ValueError("Не задан 'openrouter.api_key' в конфиге")
+
+        options = {
+            key: c[key]
+            for key in (
+                "models",
+                "vision_models",
+                "auto_discover",
+                "max_wait",
+                "rate_limit",
+                "temperature",
+                "max_completion_tokens",
+            )
+            if c.get(key) is not None
+        }
+        return ai.ChatOpenRouter(
+            api_key=c["api_key"],
+            system_prompt=system_prompt,
+            connect_timeout=(
+                self.openai_connect_timeout
+                or c.get("connect_timeout")
+                or DEFAULT_OPENAI_CONNECT_TIMEOUT
+            ),
+            timeout=self.openai_timeout or c.get("timeout") or 90.0,
+            session=self.openai_session,
+            **options,
         )
 
     # TODO: вынести в миксин какой

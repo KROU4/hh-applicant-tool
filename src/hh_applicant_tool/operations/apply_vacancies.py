@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 import requests
 
 from ..ai.base import AIError
+from ..ai.openrouter import OpenRouterDailyLimit
 from ..api import BadResponse, Redirect, datatypes
 from ..api.datatypes import PaginatedItems, SearchVacancy
 from ..api.errors import ApiError, CaptchaRequired, LimitExceeded
@@ -40,6 +41,27 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__package__)
 
+# Конец блока тестового отклика в выводе --dry-run (его разбирает Telegram-бот)
+DRY_RUN_END = "=== конец ==="
+
+DEFAULT_COVER_LETTER_SYSTEM_PROMPT = (
+    "Ты пишешь сопроводительные письма на hh.ru от первого лица за кандидата. "
+    "Начинай с «Добрый день!». Тон околопрофессиональный: уверенный и живой, "
+    "без канцелярита и штампов вроде «с огромным интересом» или «идеально "
+    "подхожу». Покажи, что кандидат закрывает ключевые требования вакансии: "
+    "опирайся на опыт из резюме, связывай его с задачами вакансии и смело "
+    "усиливай его правдоподобными деталями в пользу того, что требует "
+    "вакансия. Кандидат владеет всем, что требует вакансия: никогда не "
+    "признавай отсутствие опыта, навыка или знания, не пиши «опыта нет», "
+    "«знаком поверхностно», «готов изучить» и подобное. Не обсуждай само "
+    "резюме и никогда не принижай опыт кандидата. Не давай обещаний о "
+    "формате работы (офис, удалёнка, график), переезде и зарплате — эти "
+    "вопросы кандидат решает сам; если вакансия их касается, напиши, что "
+    "детали готов обсудить в Telegram. Не указывай телефон, email и ссылку "
+    "на резюме. Без плейсхолдеров, markdown и подписи — ответ будет "
+    "отправлен без обработки."
+)
+
 
 class Namespace(BaseNamespace):
     resume_id: str | None
@@ -52,6 +74,7 @@ class Namespace(BaseNamespace):
     ai_filter_prompt: str | None
     system_prompt: str
     message_prompt: str
+    letter_contact: str | None
     order_by: str
     search: str
     schedule: str
@@ -84,6 +107,7 @@ class Namespace(BaseNamespace):
     per_page: int
     total_pages: int
     excluded_filter: str | None
+    included_filter: str | None
     max_responses: int
     send_email: bool
     skip_tests: bool
@@ -93,6 +117,13 @@ class Operation(BaseOperation):
     """Откликнуться на все подходящие вакансии."""
 
     __aliases__ = ("apply", "apply-similar")
+
+    # Сколько откликов отправлено за запуск по всем резюме
+    total_applied: int = 0
+    # Контакт в конце AI-письма (например, ссылка на Telegram)
+    letter_contact: str = ""
+    # Регулярка ключевых слов: без совпадения вакансия пропускается
+    included_filter: str | None = None
 
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument("--resume-id", help="Идентефикатор резюме")
@@ -142,13 +173,17 @@ class Operation(BaseOperation):
             "--system-prompt",
             "--ai-system",
             help="Системный промпт для AI генерации сопроводительных писем",
-            default="Напиши сопроводительное письмо для отклика на эту вакансию. Не используй placeholder'ы, твой ответ будет отправлен без обработки.",  # noqa: E501
+            default=DEFAULT_COVER_LETTER_SYSTEM_PROMPT,
         )
         parser.add_argument(
             "--message-prompt",
             "--prompt",
             help="Промпт для генерации сопроводительного письма",
-            default="Сгенерируй сопроводительное письмо не более 5-7 предложений от моего имени для вакансии",  # noqa: E501
+            default="Сгенерируй сопроводительное письмо от моего имени для этой вакансии.",
+        )
+        parser.add_argument(
+            "--letter-contact",
+            help="Контакт в конце AI-письма, например ссылка на Telegram: https://t.me/username",
         )
         parser.add_argument(
             "--total-pages",
@@ -177,6 +212,11 @@ class Operation(BaseOperation):
             "--excluded-filter",
             type=str,
             help=r"Исключить вакансии, если название или описание не соответствует шаблону. Например, `--excluded-filter 'junior|стажир|bitrix|дружн\w+ коллектив|полиграф|open\s*space|опенспейс|хакатон|конкурс|тестов\w+ задан'`",
+        )
+        parser.add_argument(
+            "--included-filter",
+            type=str,
+            help=r"Откликаться только на вакансии, где в названии или описании есть совпадение с шаблоном. Например, `--included-filter 'llm|rag|ai[- ]?engineer|genai'`",
         )
         parser.add_argument(
             "--max-responses",
@@ -339,12 +379,14 @@ class Operation(BaseOperation):
         self.employment = args.employment
         self.excluded_employer_id = args.excluded_employer_id
         self.excluded_filter = args.excluded_filter
+        self.included_filter = args.included_filter
         self.experience = args.experience
         self.force_message = args.force_message
         self.industry = args.industry
         self.label = args.label
         self.left_lng = args.left_lng
         self.max_responses = args.max_responses
+        self.total_applied = 0
         self.metro = args.metro
         self.no_magic = args.no_magic
         self.only_with_salary = args.only_with_salary
@@ -352,6 +394,7 @@ class Operation(BaseOperation):
         self.per_page = args.per_page
         self.period = args.period
         self.message_prompt = args.message_prompt
+        self.letter_contact = (args.letter_contact or "").strip()
         self.premium = args.premium
         self.professional_role = args.professional_role
         self.resume_id = args.resume_id
@@ -454,6 +497,66 @@ class Operation(BaseOperation):
         self._resume_analysis_cache[cache_key] = result
         return result
 
+    def _build_cover_letter_prompt(
+        self, vacancy: dict, resume: dict, placeholders: dict[str, str]
+    ) -> str:
+        """Запрос к AI с полным текстом вакансии и резюме.
+
+        Раньше модель видела только названия и потому выдумывала опыт мимо
+        вакансии. Контакты и ссылку на резюме не передаём: работодатель их
+        видит, а в письме они лишние.
+        """
+        full_vacancy: dict = {}
+        if vacancy.get("id"):
+            try:
+                full_vacancy = self.api_client.get(f"/vacancies/{vacancy['id']}")
+            except ApiError as ex:
+                logger.warning("Не удалось получить вакансию: %s", ex)
+        description = strip_tags(
+            full_vacancy.get("description")
+            or " ".join(
+                filter(None, (vacancy.get("snippet") or {}).values())
+            )
+        )
+        key_skills = ", ".join(
+            s["name"] for s in full_vacancy.get("key_skills") or [] if s.get("name")
+        )
+
+        parts = [
+            self.message_prompt,
+            "",
+            "[ВАКАНСИЯ]",
+            f"Название: {placeholders['vacancy_name']}",
+            f"Работодатель: {placeholders['employer_name']}",
+        ]
+        if key_skills:
+            parts.append(f"Ключевые навыки: {key_skills}")
+        if description:
+            parts.append(f"Описание:\n{description[:4000]}")
+        parts += [
+            "",
+            "[РЕЗЮМЕ]",
+            f"Имя: {placeholders['first_name']} {placeholders['last_name']}".strip(),
+            strip_tags(self._analyze_resume_heavy(resume))[:6000]
+            or f"Должность: {placeholders['resume_title']}",
+        ]
+        if self.letter_contact:
+            parts += [
+                "",
+                "В конце напиши, что ждёшь обратной связи, и укажи Telegram "
+                f"для связи: {self.letter_contact}",
+            ]
+        return "\n".join(parts)
+
+    def _finalize_letter(self, letter: str) -> str:
+        # hh показывает письмо как обычный текст: markdown остался бы звёздочками
+        letter = re.sub(r"(\*\*|__)(.+?)\1", r"\2", letter)
+        letter = re.sub(r"^#{1,6}\s*", "", letter, flags=re.M).strip()
+        # Модель может забыть контакт — он нужен в каждом письме
+        if self.letter_contact and self.letter_contact not in letter:
+            letter += f"\n\nЖду обратной связи в Telegram: {self.letter_contact}"
+        return letter
+
     def _get_vacancy_key_skills(self, vacancy_id: str | int) -> str:
         try:
             full_vacancy = self.api_client.get(f"/vacancies/{vacancy_id}")
@@ -531,6 +634,10 @@ class Operation(BaseOperation):
                 )
                 continue
 
+            except OpenRouterDailyLimit as e:
+                # Без фильтра откликнулись бы на всё подряд
+                logger.error("AI %s недоступен, вакансия пропущена: %s", log_suffix, e)
+                return False
             except AIError as e:
                 # ChatOpenAI уже делает retry для 429, поэтому здесь только логируем
                 logger.error("Ошибка AI %s: %s", log_suffix, e)
@@ -739,6 +846,8 @@ class Operation(BaseOperation):
                 )
                 print("⛔ Лимит откликов hh.ru исчерпан. Попробуйте позже.")
                 break
+            if self.max_responses and self.total_applied >= self.max_responses:
+                break
 
         # Синхронизация откликов
         # for neg in self.tool.get_negotiations():
@@ -831,7 +940,11 @@ class Operation(BaseOperation):
             ):
                 logger.info("Операция отменена пользователем")
                 break
-            if self.max_responses and applied_count >= self.max_responses:
+            # Лимит общий на все резюме за запуск, а не на каждое
+            if (
+                self.max_responses
+                and self.total_applied + applied_count >= self.max_responses
+            ):
                 logger.info(
                     "Достигнут лимит откликов --max-responses (%d). Останавливаюсь.",
                     self.max_responses,
@@ -902,6 +1015,16 @@ class Operation(BaseOperation):
                         "Пропускаем вакансию %s с перенаправлением: %s",
                         vacancy["alternate_url"],
                         redirect_url,
+                    )
+                    continue
+
+                if not self._is_included(vacancy):
+                    logger.info(
+                        "Вакансия не содержит ключевых слов: %s",
+                        vacancy["alternate_url"],
+                    )
+                    self._save_skipped_vacancy(
+                        vacancy, "included_filter", resume["id"]
                     )
                     continue
 
@@ -1019,34 +1142,12 @@ class Operation(BaseOperation):
                     "response_letter_required"
                 ):
                     if self.cover_letter_ai:
-                        msg = self.message_prompt + "\n"
-                        ## добавляем переменные в контекст AI запроса ##
-                        msg += (
-                            "[ВАКАНСИЯ] "
-                            + "Название: "
-                            + message_placeholders["vacancy_name"] + ", "
-                            + "Работодатель: "
-                            + message_placeholders["employer_name"] + "; "
+                        msg = self._build_cover_letter_prompt(
+                            vacancy, resume, message_placeholders
                         )
-                        msg += (
-                            "[РЕЗЮМЕ] "
-                            + "Название: "
-                            + message_placeholders["resume_title"] + ", "
-                            + "Ссылка на резюме: "
-                            + message_placeholders["resume_url"] + ", "    
+                        letter = self._finalize_letter(
+                            self.cover_letter_ai.complete(msg)
                         )
-                        msg += (
-                            "Имя: "
-                            + message_placeholders["first_name"] + ", "
-                            + "Фамилия: "
-                            + message_placeholders["last_name"] + ", "
-                            + "Телефон: "
-                            + message_placeholders["phone"] + ", "
-                            + "Почта: "
-                            + message_placeholders["email"]
-                        )
-                        ## logger.debug("prompt: %s", msg) ## убираем отладку
-                        letter = self.cover_letter_ai.complete(msg)
                     else:
                         letter = render_template(
                             rand_text(self.cover_letter),
@@ -1060,6 +1161,18 @@ class Operation(BaseOperation):
                     "Пробуем откликнуться на вакансию: %s",
                     vacancy["alternate_url"],
                 )
+
+                if self.dry_run:
+                    # Считаем, чтобы --max-responses ограничивал и тестовый
+                    # прогон, и показываем, что именно ушло бы работодателю
+                    applied_count += 1
+                    print(
+                        f"🧪 Тест: откликнулся бы на «{vacancy.get('name', '')}» — "
+                        f"{employer.get('name', '')}\n{vacancy['alternate_url']}\n"
+                        f"--- письмо ---\n{letter or '(без письма)'}\n"
+                        f"{DRY_RUN_END}"
+                    )
+                    continue
 
                 test_handled = False
 
@@ -1229,6 +1342,14 @@ class Operation(BaseOperation):
                 logger.warning(ex)
             except (BadResponse, AIError) as ex:
                 logger.error(ex)
+            except requests.RequestException as ex:
+                # Сбой сети или защита сайта на одной вакансии не должны
+                # обрывать весь прогон
+                logger.error(
+                    "Сетевая ошибка на вакансии %s: %s",
+                    vacancy.get("alternate_url"),
+                    ex,
+                )
 
         logger.info(
             "Закончили рассылку откликов для резюме: %s (%s). Отправлено: %d",
@@ -1239,6 +1360,7 @@ class Operation(BaseOperation):
         print(
             f"✅️ Закончили рассылку для резюме: {resume['title']}. Отправлено: {applied_count}"
         )
+        self.total_applied += applied_count
         return limit_reached
 
     def _send_email(self, to: str, subject: str, body: str) -> None:
@@ -1550,6 +1672,44 @@ class Operation(BaseOperation):
             if page >= res["pages"] - 1:
                 return
 
+    def _vacancy_summary(self, vacancy: SearchVacancy) -> str:
+        snippet = vacancy.get("snippet") or {}
+        return " ".join(
+            filter(
+                None,
+                [
+                    vacancy.get("name"),
+                    snippet.get("requirement"),
+                    snippet.get("responsibility"),
+                ],
+            )
+        )
+
+    def _vacancy_description(self, vacancy: SearchVacancy) -> str:
+        """Полный текст вакансии; кэш, чтобы оба фильтра не грузили его дважды."""
+        vacancy_id = str(vacancy["id"])
+        cache = self.__dict__.setdefault("_description_cache", {})
+        if vacancy_id not in cache:
+            try:
+                full = self.api_client.get(f"/vacancies/{vacancy_id}")
+                cache[vacancy_id] = strip_tags(
+                    full.get("description") or ""
+                ) + " " + " ".join(
+                    s.get("name", "") for s in full.get("key_skills") or []
+                )
+            except ApiError as ex:
+                logger.warning("Не удалось получить вакансию %s: %s", vacancy_id, ex)
+                cache[vacancy_id] = ""
+        return cache[vacancy_id]
+
+    def _is_included(self, vacancy: SearchVacancy) -> bool:
+        if not self.included_filter:
+            return True
+        pattern = re.compile(self.included_filter, re.IGNORECASE)
+        if pattern.search(self._vacancy_summary(vacancy)):
+            return True
+        return bool(pattern.search(self._vacancy_description(vacancy)))
+
     def _is_excluded(self, vacancy: SearchVacancy) -> bool:
         if not self.excluded_filter:
             return False
@@ -1575,23 +1735,9 @@ class Operation(BaseOperation):
         if excluded_pat.search(vacancy_summary):
             return True
 
-        # Грузим полный текст вакансии только, если предыдущий фильтр не сработал
-        r = self.tool.session.get("https://hh.ru/vacancy/" + vacancy["id"])
-        r.raise_for_status()
-
-        # На странице вакансии поле description иногда встречается в двух
-        # вариантах верстки: `"description": "..."` и `"description":"..."`
-        # (без пробела после двоеточия) — учитываем оба.
-        description_match = re.search(r'"description":\s*(.*)', r.text)
-        if not description_match:
-            logger.warning(
-                "Не удалось найти описание вакансии на странице: %s",
-                vacancy["alternate_url"],
-            )
-            return False
-
-        description, _ = self.json_decoder.raw_decode(description_match.group(1))
-        description = strip_tags(description)
+        # Полный текст — только если сниппет не сработал. Берём из API:
+        # страница hh.ru/vacancy/… с сервера часто отвечает 403 (антибот)
+        description = self._vacancy_description(vacancy)
         logger.debug(description[:2047])
         return bool(excluded_pat.search(description))
 
