@@ -213,7 +213,7 @@ def test_first_start_claims_owner(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "screen", ["main", "settings", "schedule", "stats", "logs", "ai", "account"]
+    "screen", ["main", "settings", "schedule", "stats", "logs", "ai", "account", "answers"]
 )
 def test_all_screens_render(bot, screen):
     text, markup = bot.render(screen)
@@ -647,3 +647,19 @@ def test_owner_answers_robot_button_from_telegram(bot):
     bot.handle_update(callback("ansin:5666562040"))
     bot.handle_update(message("Готов обсудить гибрид"))
     assert calls[-1][-1] == "--text=Готов обсудить гибрид"
+
+
+def test_answers_screen_add_and_replace(bot):
+    text, markup = bot.render("answers")
+    assert "Пока пусто" in text
+
+    bot.handle_update(callback("input:answers_add"))
+    bot.handle_update(message("Формат: только удалёнка"))
+    bot.handle_update(callback("input:answers_add"))
+    bot.handle_update(message("График: любой"))
+    assert bot.answers_path.read_text(encoding="utf-8") == "Формат: только удалёнка\nГрафик: любой\n"
+    assert "График: любой" in bot.render("answers")[0]
+
+    bot.handle_update(callback("input:answers_set"))
+    bot.handle_update(message("-"))
+    assert not bot.answers_path.exists()

@@ -120,7 +120,13 @@ WELCOME_TEXT = (
     "Всё управление — кнопками ниже 👇"
 )
 
+ANSWERS_FILENAME = "candidate_answers.txt"
+
 INPUT_PROMPTS = {
+    "answers_add": "➕ Пришлите правило одной строкой, например:\n"
+    "<code>Переработки: готов при необходимости</code>\n"
+    "<code>Судимость: нет</code>",
+    "answers_set": "✏️ Пришлите весь список правил целиком (каждое с новой строки). «-» — очистить.",
     "search": "🔍 Пришлите поисковый запрос (например: <code>python разработчик</code>).\nПустой поиск = рекомендованные вакансии. «-» — очистить.",
     "included_filter": "🎯 Пришлите ключевые слова через | (регулярное выражение), например:\n"
     "<code>llm|rag|genai|ai[- ]?engineer|ai-инженер|агент</code>\n"
@@ -477,7 +483,7 @@ class HHBot:
             self.api.send_message(chat_id, reply)
             screen = "schedule" if key in ("hours", "daily_limit") else "ai" if key in (
                 "openrouter_key",
-            ) else "settings"
+            ) else "answers" if key.startswith("answers_") else "settings"
             self.send_screen(chat_id, screen)
             return
 
@@ -702,9 +708,33 @@ class HHBot:
                 button("📨 Контакт в письме", "input:letter_contact"),
                 button("✉️ Шаблон письма", "input:letter"),
             ],
+            [button("📋 Ответы рекрутерам", "screen:answers")],
             [button("◀️ Назад", "screen:main")],
         )
         return "\n".join(lines), markup
+
+    @property
+    def answers_path(self) -> Path:
+        return self.config_path / ANSWERS_FILENAME
+
+    def screen_answers(self) -> tuple[str, dict]:
+        current = (
+            self.answers_path.read_text(encoding="utf-8").strip()
+            if self.answers_path.exists()
+            else ""
+        )
+        text = (
+            "<b>📋 Ответы рекрутерам</b>\n"
+            "Ваши решения по типовым вопросам. Автоответчик отвечает по ним сам — "
+            "текстом или кнопкой «да/нет». Если вопроса здесь нет, он зовёт вас.\n\n"
+            + (f"<pre>{esc(current[:3000])}</pre>" if current else "<i>Пока пусто</i>")
+        )
+        markup = keyboard(
+            [button("➕ Дописать правило", "input:answers_add")],
+            [button("✏️ Заменить всё", "input:answers_set")],
+            [button("◀️ Назад", "screen:settings")],
+        )
+        return text, markup
 
     def screen_schedule(self) -> tuple[str, dict]:
         sch = self.state.get("schedule")
@@ -1112,6 +1142,20 @@ class HHBot:
                 return f"❌ Ошибка в шаблоне: {esc(ex)}"
             self.letter_path.write_text(template, encoding="utf-8")
             return "✅ Шаблон сохранён"
+        if key in ("answers_add", "answers_set"):
+            current = (
+                self.answers_path.read_text(encoding="utf-8").strip()
+                if self.answers_path.exists()
+                else ""
+            )
+            if clear:
+                self.answers_path.unlink(missing_ok=True)
+                return "✅ Ответы очищены"
+            rule = text.strip()
+            if key == "answers_add" and current:
+                rule = f"{current}\n{rule}"
+            self.answers_path.write_text(rule + "\n", encoding="utf-8")
+            return "✅ Сохранено — автоответчик учтёт при следующей проверке чатов"
         if key == "daily_limit":
             if clear:
                 self.state.set("schedule", key, 0)

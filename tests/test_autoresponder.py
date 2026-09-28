@@ -175,7 +175,7 @@ def test_human_decision_redirects_to_telegram_and_is_reported(capsys):
 
     system_prompt = op.tool.get_cover_letter_ai.call_args.args[0]
     assert "никогда не признавай отсутствие опыта" in system_prompt
-    assert "Не давай обещаний" in system_prompt
+    assert "не давай обещаний от себя" in system_prompt
     sent = op._post.call_args.args[1]["text"]
     assert "[НУЖЕН_ЧЕЛОВЕК]" not in sent
     assert sent.endswith("Это удобнее обсудить в Telegram: https://t.me/krou4")
@@ -299,3 +299,28 @@ def test_send_chat_mode_sends_one_message():
     op.run(op.tool, args)
     path, body, _ = op._post.call_args.args
     assert path == "/chatik/api/send" and body["chatId"] == 42 and body["text"] == "да"
+
+
+def test_candidate_answers_let_bot_answer_office_question_itself():
+    op = make_operation()
+    (op.tool.config_path / "candidate_answers.txt").write_text(
+        "Формат: только удалёнка, на офис и гибрид — «нет».\nГрафик: любой — соглашайся.\n",
+        encoding="utf-8",
+    )
+    chat = op.parse_chat_item(chat_item(15, is_bot=True), VACANCIES, {}, RESUMES[1])
+    office = {
+        "id": 900,
+        "participantId": "90236278",
+        "text": "Готовы ли к офисному формату м. Курская?",
+        "participantDisplay": {"isBot": True, "name": "Робот-рекрутер"},
+        "actions": {"text_buttons": [{"text": "да"}, {"text": "нет"}]},
+    }
+    _robot_chat(op, [office])
+    ai = op.tool.get_cover_letter_ai.return_value
+    ai.complete.return_value = "нет"
+
+    op.reply_to_chat(chat)
+
+    system_prompt = op.tool.get_cover_letter_ai.call_args.args[0]
+    assert "только удалёнка" in system_prompt and "Решения соискателя" in system_prompt
+    assert op._post.call_args.args[1]["text"] == "нет"
