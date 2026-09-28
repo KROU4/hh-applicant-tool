@@ -41,6 +41,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__package__)
 
+# Конец блока тестового отклика в выводе --dry-run (его разбирает Telegram-бот)
+DRY_RUN_END = "=== конец ==="
+
 DEFAULT_COVER_LETTER_SYSTEM_PROMPT = (
     "Ты пишешь сопроводительные письма на hh.ru от первого лица за кандидата. "
     "Начинай с «Добрый день!». Тон околопрофессиональный: уверенный и живой, "
@@ -1150,6 +1153,18 @@ class Operation(BaseOperation):
                     "Пробуем откликнуться на вакансию: %s",
                     vacancy["alternate_url"],
                 )
+
+                if self.dry_run:
+                    # Считаем, чтобы --max-responses ограничивал и тестовый
+                    # прогон, и показываем, что именно ушло бы работодателю
+                    applied_count += 1
+                    print(
+                        f"🧪 Тест: откликнулся бы на «{vacancy.get('name', '')}» — "
+                        f"{employer.get('name', '')}\n{vacancy['alternate_url']}\n"
+                        f"--- письмо ---\n{letter or '(без письма)'}\n"
+                        f"{DRY_RUN_END}"
+                    )
+                    continue
 
                 test_handled = False
 

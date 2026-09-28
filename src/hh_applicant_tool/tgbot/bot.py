@@ -100,6 +100,9 @@ SERVER_CONFIG_KEYS = ("openrouter", "telegram_bot", "proxy_url")
 SUCCESS_CODES = {"refresh_token": (0, 2)}
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 APPLIED_RE = re.compile(r"Отправлено:\s*(\d+)")
+# Блоки тестовых откликов из вывода apply-vacancies --dry-run
+DRY_RUN_RE = re.compile(r"(🧪 Тест: .*?)\n=== конец ===", re.S)
+DRY_RUN_LIMIT = 5
 
 INPUT_PROMPTS = {
     "search": "🔍 Пришлите поисковый запрос (например: <code>python разработчик</code>).\nПустой поиск = рекомендованные вакансии. «-» — очистить.",
@@ -894,6 +897,15 @@ class HHBot:
         if action == "run":
             answer = self.start_task(arg)
             self.show(chat_id, message_id, "stats" if arg == "clear" else "main")
+            if arg == "apply" and answer == "Запущено":
+                self.api.send_message(
+                    chat_id,
+                    f"🧪 Тестовый прогон запущен: до {DRY_RUN_LIMIT} вакансий, "
+                    "ничего не отправляется. Минуты через 2–4 пришлю вакансии "
+                    "и письма, которые ушли бы работодателям."
+                    if self.state.get("apply", "dry_run")
+                    else "🚀 Отклики запущены. Пришлю итог, когда закончу.",
+                )
         elif action == "stop":
             answer = (
                 "Останавливаю…" if self.runner.stop(arg) else "Задача не запущена"
@@ -1164,12 +1176,17 @@ class HHBot:
     def start_task(self, name: str, *, scheduled: bool = False) -> str:
         args = self.task_args(name)
         if name == "apply":
-            left = self.apply_quota_left()
-            if left <= 0:
-                return "Суточный лимит откликов уже набран"
-            # Квота на 24 часа важнее лимита «за запуск» из настроек
             own = self.state.get("apply", "max_responses")
-            limit = min(left, own) if own else left
+            if self.state.get("apply", "dry_run"):
+                # Тест ничего не отправляет: квота не нужна, а несколько
+                # вакансий достаточно, чтобы оценить поиск и письма
+                limit = min(own, DRY_RUN_LIMIT) if own else DRY_RUN_LIMIT
+            else:
+                left = self.apply_quota_left()
+                if left <= 0:
+                    return "Суточный лимит откликов уже набран"
+                # Квота на 24 часа важнее лимита «за запуск» из настроек
+                limit = min(left, own) if own else left
             if limit < 10**9:
                 args = _without_option(args, "--max-responses")
                 args += ["--max-responses", str(limit)]
@@ -1215,8 +1232,11 @@ class HHBot:
         # Плановые задачи без ошибок не должны спамить уведомлениями
         if task.scheduled and code == 0 and task.name != "apply":
             return
+        dry_run = task.name == "apply" and "--dry-run" in task.args
+        if dry_run and not task.stopped_by_user:
+            self._send_dry_run_report(log)
         text = f"<b>{esc(head)}</b>"
-        if task.name == "apply" and code == 0:
+        if task.name == "apply" and code == 0 and not dry_run:
             text += f"\nОтправлено откликов: <b>{applied}</b>"
         if summary:
             text += f"\n<pre>{esc(summary[-3000:])}</pre>"
@@ -1227,6 +1247,21 @@ class HHBot:
             silent=task.scheduled and code == 0,
             markup=keyboard([button("📜 Полный лог", f"log:{task.name}"), button("🏠 Меню", "screen:main")]),
         )
+
+    def _send_dry_run_report(self, log: str) -> None:
+        """Каждый тестовый отклик — отдельным сообщением: вакансия и письмо."""
+        blocks = DRY_RUN_RE.findall(ANSI_RE.sub("", log))
+        self.notify(
+            f"🧪 <b>Тест: подходящих вакансий {len(blocks)}</b>"
+            + ("" if blocks else "\nНичего не нашлось — проверьте ключевые слова и поиск.")
+        )
+        for block in blocks[:DRY_RUN_LIMIT]:
+            head, _, letter = block.partition("--- письмо ---")
+            title, _, url = head.strip().partition("\n")
+            title = title.removeprefix("🧪 Тест: откликнулся бы на ").strip()
+            self.notify(
+                f"<b>{esc(title)}</b>\n{esc(url.strip())}\n\n{esc(letter.strip()[:3500])}"
+            )
 
     def _applied_log(self, now: float) -> list[list[float]]:
         log = self.state.get("runs").get("applied_log") or []

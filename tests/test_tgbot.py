@@ -511,3 +511,33 @@ def test_keywords_drive_search_and_filter(bot, tmp_path):
     bot.state.set("apply", "search", "python")
     args = build_apply_args(bot.state.get("apply"), tmp_path / "letter.txt")
     assert HHApplicantTool()._parser.parse_args(args).search == "python"
+
+
+def test_dry_run_is_limited_and_ignores_quota(bot):
+    bot.state.set("apply", "dry_run", True)
+    bot.state.set("runs", "applied_log", [[time.time() - 60, 200]])
+    assert bot.start_task("apply") == "Запущено"
+    args = bot.runner.started[-1][1]
+    assert _max_responses(args) == 5 and "--dry-run" in args
+
+
+def test_dry_run_report_sends_each_letter(bot):
+    log = (
+        "🚀 Начинаю рассылку откликов для резюме: Senior AI Engineer\n"
+        "🧪 Тест: откликнулся бы на «LLM Engineer» — Лайфтех\n"
+        "https://hh.ru/vacancy/1\n--- письмо ---\nДобрый день!\nПишу по вакансии.\n"
+        "=== конец ===\n"
+        "🧪 Тест: откликнулся бы на «AI Developer» — ТГТ\n"
+        "https://hh.ru/vacancy/2\n--- письмо ---\nДобрый день! <b>RAG</b>\n=== конец ===\n"
+        "✅️ Закончили рассылку для резюме: Senior AI Engineer. Отправлено: 2\n"
+    )
+    (bot.runner.logs_dir / "apply.log").write_text(log, encoding="utf-8")
+    task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies", "--dry-run"])
+    bot._on_task_finish(task, 0)
+
+    texts = [t for _, t, _ in bot.api.sent]
+    assert "подходящих вакансий 2" in texts[0]
+    assert texts[1].startswith("<b>«LLM Engineer» — Лайфтех</b>\nhttps://hh.ru/vacancy/1")
+    assert "Пишу по вакансии." in texts[1]
+    assert "&lt;b&gt;RAG&lt;/b&gt;" in texts[2]
+    assert bot.applied_24h() == 0

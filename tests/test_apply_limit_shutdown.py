@@ -211,3 +211,22 @@ class TestIncludedFilter:
         assert len(applied) == 2
         # Без совпадения — просто пропуск, не чёрный список hh
         assert not op.tool.api_client.put.called
+
+
+class TestDryRun:
+    def test_dry_run_prints_letters_and_respects_limit(self, capsys):
+        op = _make_operation(max_responses=2)
+        op.dry_run = True
+        op.force_message = True
+        op.cover_letter_ai = None
+        op._get_vacancies = lambda resume_id=None: iter(
+            _make_vacancy(i) for i in range(10)
+        )
+        resume = {"id": "r1", "title": "Dev", "alternate_url": "u"}
+        user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+        op._apply_resume(resume=resume, user=user, seen_employers=set())
+
+        out = capsys.readouterr().out
+        assert out.count("🧪 Тест: откликнулся бы на") == 2
+        assert "--- письмо ---" in out and "=== конец ===" in out
+        assert not op.tool.api_client.post.called
