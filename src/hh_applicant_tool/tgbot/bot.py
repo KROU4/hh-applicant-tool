@@ -1145,6 +1145,9 @@ class HHBot:
             args = ["autoresponder", "--interval", "120"]
             if self.state.get("schedule", "autoresponder_delete_discards"):
                 args.append("--delete")
+            contact = self.state.get("apply", "letter_contact")
+            if contact:
+                args.append(f"--contact={contact}")
             return args
         if name == "clear":
             return ["clear-negotiations"]
