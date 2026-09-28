@@ -1,0 +1,25 @@
+[Unit]
+Description=hh-applicant-tool Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hhbot
+Group=hhbot
+WorkingDirectory=/opt/hh-applicant-tool
+Environment=CONFIG_DIR=/opt/hh-applicant-tool/config
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+ExecStart=/opt/hh-applicant-tool/venv/bin/python -m hh_applicant_tool telegram-bot
+Restart=always
+RestartSec=10
+# На маленьком VPS бот и его задачи не должны отнимать память у VPN:
+# при нехватке OOM-killer в первую очередь выберет их.
+MemoryHigh=250M
+MemoryMax=350M
+OOMScoreAdjust=500
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
