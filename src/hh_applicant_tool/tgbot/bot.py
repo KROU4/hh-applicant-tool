@@ -1263,6 +1263,9 @@ class HHBot:
         )
         if task is None:
             return "Уже выполняется"
+        if name == "autoresponder":
+            # Лог пересоздан — события читаем с начала, ничего не теряя
+            self._events_offset = 0
         self.state.mark_run(name, time.time())
         return "Запущено"
 
