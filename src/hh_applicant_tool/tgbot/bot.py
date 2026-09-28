@@ -53,7 +53,9 @@ EXPERIENCE_TITLES = {
     "between3And6": "3–6 лет",
     "moreThan6": "6+ лет",
 }
-APPLY_INTERVALS = [1, 2, 3, 4, 6, 8, 12]
+APPLY_INTERVALS = [24, 12, 8, 6, 4]
+# Скользящее окно суточной квоты откликов
+QUOTA_WINDOW = 24 * 3600
 NEGOTIATION_STATES = {
     "response": "📨 отправлено",
     "invitation": "🎉 приглашения",
@@ -108,6 +110,7 @@ INPUT_PROMPTS = {
     "Подстановки: {vacancy_name}, {employer_name}, {first_name}, {last_name}, {phone}, {email}, {resume_url}.\n"
     "Случайный вариант: {Здравствуйте|Добрый день}.",
     "hours": "🕘 Пришлите часы работы автооткликов в формате <code>9-21</code>.",
+    "daily_limit": "🎯 Сколько откликов максимум за 24 часа (включая ручные запуски)? У hh.ru потолок 200. «-» — без лимита.",
     "openrouter_key": "🔑 Пришлите ключ OpenRouter (sk-or-...).",
 }
 
@@ -205,6 +208,21 @@ def normalize_letter(text: str) -> str:
         "шаблоне письма",
     )
     return text
+
+
+def _without_option(args: list[str], option: str) -> list[str]:
+    """Убирает опцию вместе со значением из списка аргументов."""
+    result: list[str] = []
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+            continue
+        if arg == option:
+            skip = True
+            continue
+        result.append(arg)
+    return result
 
 
 def summarize_log(text: str, limit: int = 12) -> str:
@@ -371,7 +389,7 @@ class HHBot:
         if key:
             reply = self.apply_input(key, text)
             self.api.send_message(chat_id, reply)
-            screen = "schedule" if key == "hours" else "ai" if key in (
+            screen = "schedule" if key in ("hours", "daily_limit") else "ai" if key in (
                 "openrouter_key",
             ) else "settings"
             self.send_screen(chat_id, screen)
@@ -448,7 +466,7 @@ class HHBot:
         cfg = self.tool_config()
         token = (cfg.get("token") or {}).get("access_token")
         running = [self._task_line(t.name) for t in self.runner.running_tasks()]
-        applied = self._applied_today()
+        applied = self.applied_24h()
 
         lines = [
             "<b>🤖 HH панель управления</b>",
@@ -463,7 +481,8 @@ class HHBot:
             f"{on_off(sch['update_resumes_enabled'])} подъём резюме каждые 4ч",
             f"{on_off(sch['autoresponder_enabled'])} автоответчик в чатах",
             "",
-            f"Откликов сегодня: <b>{applied}</b>",
+            f"Откликов за 24 часа: <b>{applied}</b>"
+            + (f" из {sch['daily_limit']}" if sch.get("daily_limit") else ""),
         ]
         if self.state.get("apply", "dry_run"):
             lines.append("⚠️ Включён тестовый режим: отклики не отправляются")
@@ -580,9 +599,17 @@ class HHBot:
             "<b>⏰ Расписание</b>",
             f"Время сервера ({sch['timezone']}): {local:%d.%m %H:%M}",
             "",
-            f"{on_off(sch['apply_enabled'])} Автоотклики каждые {sch['apply_every_hours']}ч "
-            f"с {sch['hours_from']}:00 до {sch['hours_to']}:00",
+            f"{on_off(sch['apply_enabled'])} Автоотклики "
+            + (
+                "раз в сутки (24–25ч)"
+                if sch["apply_every_hours"] >= 24
+                else f"каждые {sch['apply_every_hours']}ч"
+            )
+            + f", запуск с {sch['hours_from']}:00 до {sch['hours_to']}:00",
             f"   следующий запуск: {when(next_apply) if sch['apply_enabled'] else '—'}",
+            f"🎯 Не больше {sch['daily_limit'] or '∞'} откликов за 24 часа "
+            f"(отправлено: {self.applied_24h()}, осталось: "
+            f"{self.apply_quota_left() if sch['daily_limit'] else '∞'})",
             f"{on_off(sch['update_resumes_enabled'])} Подъём резюме каждые 4ч",
             f"   следующий запуск: {when(next_update) if sch['update_resumes_enabled'] else '—'}",
             f"{on_off(sch['autoresponder_enabled'])} Автоответчик (проверка чатов раз в 2 мин)",
@@ -601,6 +628,7 @@ class HHBot:
                 ),
                 button("🕘 Часы работы", "input:hours"),
             ],
+            [button(f"🎯 Лимит в сутки: {sch['daily_limit'] or '∞'}", "input:daily_limit")],
             [
                 button(
                     f"⬆️ Подъём резюме {on_off(sch['update_resumes_enabled'])}",
@@ -623,7 +651,7 @@ class HHBot:
 
     def screen_stats(self) -> tuple[str, dict]:
         lines = ["<b>📊 Статистика</b>", ""]
-        lines.append(f"Откликов сегодня (по логам бота): <b>{self._applied_today()}</b>")
+        lines.append(f"Откликов за 24 часа (по логам бота): <b>{self.applied_24h()}</b>")
         db_path = self.config_path / DATABASE_FILENAME
         if db_path.exists():
             try:
@@ -932,6 +960,14 @@ class HHBot:
                 return f"❌ Ошибка в шаблоне: {esc(ex)}"
             self.letter_path.write_text(template, encoding="utf-8")
             return "✅ Шаблон сохранён"
+        if key == "daily_limit":
+            if clear:
+                self.state.set("schedule", key, 0)
+                return "✅ Суточный лимит снят"
+            if not text.isdigit() or int(text) <= 0:
+                return "❌ Нужно положительное число"
+            self.state.set("schedule", key, int(text))
+            return f"✅ Не больше {text} откликов за 24 часа"
         if key == "hours":
             match = re.fullmatch(r"\s*(\d{1,2})\s*[-–]\s*(\d{1,2})\s*", text)
             if not match or int(match[1]) > 23 or int(match[2]) > 24:
@@ -1044,9 +1080,26 @@ class HHBot:
             return ["refresh-token"]
         raise ValueError(name)
 
+    def apply_quota_left(self, now: float | None = None) -> int:
+        limit = int(self.state.get("schedule", "daily_limit") or 0)
+        if limit <= 0:
+            return 10**9
+        return max(limit - self.applied_24h(now), 0)
+
     def start_task(self, name: str, *, scheduled: bool = False) -> str:
+        args = self.task_args(name)
+        if name == "apply":
+            left = self.apply_quota_left()
+            if left <= 0:
+                return "Суточный лимит откликов уже набран"
+            # Квота на 24 часа важнее лимита «за запуск» из настроек
+            own = self.state.get("apply", "max_responses")
+            limit = min(left, own) if own else left
+            if limit < 10**9:
+                args = _without_option(args, "--max-responses")
+                args += ["--max-responses", str(limit)]
         task = self.runner.start(
-            name, TASK_TITLES[name], self.task_args(name), scheduled=scheduled
+            name, TASK_TITLES[name], args, scheduled=scheduled
         )
         if task is None:
             return "Уже выполняется"
@@ -1061,7 +1114,8 @@ class HHBot:
         applied = 0
         if task.name == "apply":
             applied = sum(int(n) for n in APPLIED_RE.findall(log))
-            self._add_applied_today(applied)
+            if "--dry-run" not in task.args:
+                self._record_applied(applied)
         if task.name == "autoresponder":
             if task.elapsed < 120 and not task.stopped_by_user:
                 self.state.mark_run(
@@ -1099,16 +1153,21 @@ class HHBot:
             markup=keyboard([button("📜 Полный лог", f"log:{task.name}"), button("🏠 Меню", "screen:main")]),
         )
 
-    def _applied_today(self) -> int:
-        today = self.now_local().strftime("%Y-%m-%d")
-        runs = self.state.get("runs")
-        return int(runs.get(f"applied:{today}", 0))
+    def _applied_log(self, now: float) -> list[list[float]]:
+        log = self.state.get("runs").get("applied_log") or []
+        return [r for r in log if r[0] > now - QUOTA_WINDOW]
 
-    def _add_applied_today(self, count: int) -> None:
+    def applied_24h(self, now: float | None = None) -> int:
+        now = now or time.time()
+        return int(sum(count for _, count in self._applied_log(now)))
+
+    def _record_applied(self, count: int) -> None:
         if not count:
             return
-        today = self.now_local().strftime("%Y-%m-%d")
-        self.state.set("runs", f"applied:{today}", self._applied_today() + count)
+        now = time.time()
+        self.state.set(
+            "runs", "applied_log", self._applied_log(now) + [[now, count]]
+        )
 
     # ------------------------------------------------------------- scheduler
 
@@ -1142,11 +1201,16 @@ class HHBot:
             and now >= self.state.last_run("apply_next")
             and not self.runner.running("apply")
         ):
-            self.start_task("apply", scheduled=True)
-            self.state.mark_run(
-                "apply_next",
-                now + sch["apply_every_hours"] * 3600 + random.randint(60, 600),
-            )
+            every = sch["apply_every_hours"] * 3600
+            if self.apply_quota_left(now) <= 0:
+                # Квота ещё не освободилась — проверим через час
+                self.state.mark_run("apply_next", now + 3600)
+            else:
+                self.start_task("apply", scheduled=True)
+                # Раз в сутки — со случайным сдвигом до часа (24–25 ч),
+                # чтобы запуски не выглядели как по будильнику
+                jitter = random.randint(60, 3600 if every >= 86400 else 600)
+                self.state.mark_run("apply_next", now + every + jitter)
 
         if (
             sch["update_resumes_enabled"]

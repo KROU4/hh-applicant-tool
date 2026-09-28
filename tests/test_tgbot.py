@@ -301,7 +301,7 @@ def test_apply_finish_counts_responses(bot):
     )
     task = bot.runner.start("apply", "🚀 Отклики", [])
     bot._on_task_finish(task, 0)
-    assert bot._applied_today() == 7
+    assert bot.applied_24h() == 7
     assert "Отправлено откликов: <b>7</b>" in bot.api.sent[-1][1]
 
 
@@ -402,3 +402,67 @@ def test_redact_hides_bot_token():
 
     msg = "HTTPSConnectionPool: /bot123456:AA-bb_cc/getUpdates timed out"
     assert "AA-bb_cc" not in redact(msg)
+
+
+def _max_responses(args: list[str]) -> int:
+    return int(args[args.index("--max-responses") + 1])
+
+
+def test_apply_run_is_capped_by_daily_quota(bot):
+    bot.state.set("runs", "applied_log", [[time.time() - 3600, 150]])
+    bot.handle_update(callback("run:apply"))
+    args = bot.runner.started[-1][1]
+    assert _max_responses(args) == 50
+    assert args.count("--max-responses") == 1
+
+
+def test_own_run_limit_is_kept_when_smaller(bot):
+    bot.state.set("apply", "max_responses", 30)
+    bot.start_task("apply")
+    assert _max_responses(bot.runner.started[-1][1]) == 30
+
+
+def test_quota_exhausted_blocks_manual_and_scheduled_runs(bot):
+    bot.state.set("runs", "applied_log", [[time.time() - 60, 200]])
+    assert bot.start_task("apply") == "Суточный лимит откликов уже набран"
+
+    bot.state.set("schedule", "apply_enabled", True)
+    bot.state.set("schedule", "hours_from", 0)
+    bot.state.set("schedule", "hours_to", 0)
+    bot.state.set("schedule", "update_resumes_enabled", False)
+    now = time.time()
+    bot.tick(now)
+    assert "apply" not in [name for name, _, _ in bot.runner.started]
+    assert bot.state.last_run("apply_next") == pytest.approx(now + 3600)
+
+
+def test_quota_window_is_rolling_24h(bot):
+    now = time.time()
+    bot.state.set(
+        "runs", "applied_log", [[now - 25 * 3600, 200], [now - 3600, 20]]
+    )
+    assert bot.applied_24h(now) == 20
+    assert bot.apply_quota_left(now) == 180
+
+
+def test_daily_schedule_next_run_in_24_to_25_hours(bot):
+    bot.state.set("schedule", "apply_enabled", True)
+    bot.state.set("schedule", "hours_from", 0)
+    bot.state.set("schedule", "hours_to", 0)
+    now = time.time()
+    bot.tick(now)
+    next_run = bot.state.last_run("apply_next") - now
+    assert 24 * 3600 < next_run <= 25 * 3600
+
+
+def test_dry_run_is_not_counted(bot):
+    (bot.runner.logs_dir / "apply.log").write_text("Отправлено: 9\n", encoding="utf-8")
+    task = bot.runner.start("apply", "🚀", ["apply-vacancies", "--dry-run"])
+    bot._on_task_finish(task, 0)
+    assert bot.applied_24h() == 0
+
+
+def test_daily_limit_input(bot):
+    bot.handle_update(callback("input:daily_limit"))
+    bot.handle_update(message("150"))
+    assert bot.state.get("schedule", "daily_limit") == 150

@@ -95,6 +95,9 @@ class Operation(BaseOperation):
 
     __aliases__ = ("apply", "apply-similar")
 
+    # Сколько откликов отправлено за запуск по всем резюме
+    total_applied: int = 0
+
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument("--resume-id", help="Идентефикатор резюме")
         parser.add_argument(
@@ -346,6 +349,7 @@ class Operation(BaseOperation):
         self.label = args.label
         self.left_lng = args.left_lng
         self.max_responses = args.max_responses
+        self.total_applied = 0
         self.metro = args.metro
         self.no_magic = args.no_magic
         self.only_with_salary = args.only_with_salary
@@ -744,6 +748,8 @@ class Operation(BaseOperation):
                 )
                 print("⛔ Лимит откликов hh.ru исчерпан. Попробуйте позже.")
                 break
+            if self.max_responses and self.total_applied >= self.max_responses:
+                break
 
         # Синхронизация откликов
         # for neg in self.tool.get_negotiations():
@@ -836,7 +842,11 @@ class Operation(BaseOperation):
             ):
                 logger.info("Операция отменена пользователем")
                 break
-            if self.max_responses and applied_count >= self.max_responses:
+            # Лимит общий на все резюме за запуск, а не на каждое
+            if (
+                self.max_responses
+                and self.total_applied + applied_count >= self.max_responses
+            ):
                 logger.info(
                     "Достигнут лимит откликов --max-responses (%d). Останавливаюсь.",
                     self.max_responses,
@@ -1244,6 +1254,7 @@ class Operation(BaseOperation):
         print(
             f"✅️ Закончили рассылку для резюме: {resume['title']}. Отправлено: {applied_count}"
         )
+        self.total_applied += applied_count
         return limit_reached
 
     def _send_email(self, to: str, subject: str, body: str) -> None:

@@ -35,7 +35,9 @@ DEFAULTS: dict[str, Any] = {
     },
     "schedule": {
         "apply_enabled": False,
-        "apply_every_hours": 2,
+        "apply_every_hours": 24,
+        # Не больше стольких откликов за скользящие 24 часа (0 — без лимита)
+        "daily_limit": 200,
         "hours_from": 9,
         "hours_to": 21,
         "update_resumes_enabled": True,

@@ -122,3 +122,20 @@ class TestGracefulShutdown:
         # The cancel event yields the first 3, then the loop must break
         assert len(applied) == 3
         assert op.tool.api_client.post.call_count <= 3
+
+
+class TestMaxResponsesAcrossResumes:
+    def test_limit_is_shared_by_all_resumes(self):
+        """--max-responses 5 при двух резюме — всего 5 откликов, а не 10."""
+        op = _make_operation(max_responses=5)
+        op._get_vacancies = lambda resume_id=None: iter(
+            _make_vacancy(f"{resume_id}-{i}") for i in range(20)
+        )
+        user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+
+        for rid in ("r1", "r2"):
+            resume = {"id": rid, "title": "Dev", "alternate_url": "u"}
+            op._apply_resume(resume=resume, user=user, seen_employers=set())
+
+        assert op.tool.api_client.post.call_count == 5
+        assert op.total_applied == 5
