@@ -179,3 +179,66 @@ def test_human_decision_redirects_to_telegram_and_is_reported(capsys):
     out = capsys.readouterr().out
     assert out.startswith("🙋 Нужно ваше решение: «AI / ML-инженер» — Смарт СТиМ Сити")
     assert out.rstrip().endswith("=== конец ===")
+
+
+def _robot_chat(op, items):
+    op._get = MagicMock(return_value={"chat": {
+        "currentParticipantId": ME,
+        "writePossibility": {"name": "ENABLED_FOR_ALL_BY_EMPLOYER"},
+        "messages": {"items": items},
+    }})
+    op._post = MagicMock(return_value={})
+    op.tool.api_client.get.return_value = RESUMES[1]
+
+
+QUESTION = {
+    "participantId": "90236278",
+    "text": "Есть ли у вас опыт работы с код-агентами?",
+    "participantDisplay": {"isBot": True, "name": "Робот-рекрутер"},
+    "actions": {"text_buttons": [{"size": "full", "text": "да"}, {"size": "full", "text": "нет"}]},
+}
+
+
+def test_robot_buttons_are_answered_with_button_text():
+    op = make_operation()
+    chat = op.parse_chat_item(chat_item(10, is_bot=True), VACANCIES, {}, RESUMES[1])
+    _robot_chat(op, [QUESTION])
+    op.tool.get_cover_letter_ai.return_value.complete.return_value = (
+        "Да, есть. Проектировал агентные LLM-системы."
+    )
+
+    op.reply_to_chat(chat)
+
+    assert op._post.call_args.args[1]["text"] == "да"
+    prompt = op.tool.get_cover_letter_ai.return_value.complete.call_args.args[0]
+    assert "- да" in prompt and "- нет" in prompt
+
+
+def test_no_reply_marker_repeated_question_and_left_robot_skip_sending():
+    op = make_operation()
+    chat = op.parse_chat_item(chat_item(11), VACANCIES, {}, RESUMES[1])
+    ai = op.tool.get_cover_letter_ai.return_value
+
+    _robot_chat(op, [{"participantId": EMPLOYER, "text": "Спасибо! Ответы переданы работодателю."}])
+    ai.complete.return_value = "[БЕЗ_ОТВЕТА]"
+    op.reply_to_chat(chat)
+    op._post.assert_not_called()
+
+    _robot_chat(op, [QUESTION, {"participantId": ME, "text": "да"}] * 2 + [QUESTION])
+    op.reply_to_chat(chat)
+    op._post.assert_not_called()
+
+    _robot_chat(op, [
+        {"participantId": EMPLOYER, "text": "Спасибо!"},
+        {"participantId": "90236278", "text": "", "type": "PARTICIPANT_LEFT"},
+    ])
+    op.reply_to_chat(chat)
+    op._post.assert_not_called()
+
+
+def test_pick_option():
+    from hh_applicant_tool.operations.autoresponder import pick_option
+
+    assert pick_option("Да, есть.", ["да", "нет"]) == "да"
+    assert pick_option("нет", ["да", "нет"]) == "нет"
+    assert pick_option("Скорее всего", ["Готов", "Не готов"]) == "Готов"

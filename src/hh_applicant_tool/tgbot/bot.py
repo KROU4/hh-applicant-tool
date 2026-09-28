@@ -66,6 +66,8 @@ NEGOTIATION_STATES = {
 }
 
 UPDATE_RESUMES_EVERY = 4 * 3600
+# Через сколько повторить оборвавшийся прогон откликов
+APPLY_RETRY_DELAY = 30 * 60
 AUTORESPONDER_RESTART_EVERY = 6 * 3600
 AUTORESPONDER_BACKOFF = 10 * 60
 REFRESH_TOKEN_EVERY = 20 * 3600
@@ -100,6 +102,7 @@ SERVER_CONFIG_KEYS = ("openrouter", "telegram_bot", "proxy_url")
 SUCCESS_CODES = {"refresh_token": (0, 2)}
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 APPLIED_RE = re.compile(r"Отправлено:\s*(\d+)")
+SENT_RE = re.compile(r"^📨 Отправили отклик", re.M)
 # Блоки тестовых откликов из вывода apply-vacancies --dry-run
 DRY_RUN_RE = re.compile(r"(🧪 Тест: .*?)\n=== конец ===", re.S)
 DRY_RUN_LIMIT = 5
@@ -1210,7 +1213,11 @@ class HHBot:
             code = 0
         applied = 0
         if task.name == "apply":
-            applied = sum(int(n) for n in APPLIED_RE.findall(log))
+            # По каждой отправке: итоговой строки нет, если прогон оборвался
+            applied = max(
+                len(SENT_RE.findall(log)),
+                sum(int(n) for n in APPLIED_RE.findall(log)),
+            )
             if "--dry-run" not in task.args:
                 self._record_applied(applied)
         if task.name == "autoresponder":
@@ -1240,6 +1247,21 @@ class HHBot:
         dry_run = task.name == "apply" and "--dry-run" in task.args
         if dry_run and not task.stopped_by_user:
             self._send_dry_run_report(log)
+        retry_note = ""
+        if (
+            task.name == "apply"
+            and code != 0
+            and not dry_run
+            and not task.stopped_by_user
+            and self.state.get("schedule", "apply_enabled")
+            and self.apply_quota_left() > 0
+        ):
+            # Прогон оборвался — добираем суточную квоту, а не ждём сутки
+            self.state.mark_run("apply_next", time.time() + APPLY_RETRY_DELAY)
+            retry_note = (
+                f"\n\n🔁 Осталось {self.apply_quota_left()} откликов на сегодня — "
+                f"повторю через {APPLY_RETRY_DELAY // 60} мин."
+            )
         text = f"<b>{esc(head)}</b>"
         if task.name == "apply" and code == 0 and not dry_run:
             text += f"\nОтправлено откликов: <b>{applied}</b>"
@@ -1247,6 +1269,7 @@ class HHBot:
             text += f"\n<pre>{esc(summary[-3000:])}</pre>"
         if auth_problem:
             text += "\n\n🔑 Похоже, слетела авторизация — загляните в 👤 Аккаунт."
+        text += retry_note
         self.notify(
             text,
             silent=task.scheduled and code == 0,
@@ -1322,15 +1345,12 @@ class HHBot:
         text = ANSI_RE.sub("", complete.decode("utf-8", "replace"))
         for block in CHAT_EVENT_RE.findall(text):
             head, _, body = block.partition("\n")
-            needs_human = head.startswith("🙋")
+            # Обычные ответы видны в 📜 Логи; уведомляем только когда нужен владелец
+            if not head.startswith("🙋"):
+                continue
             self.notify(
                 f"<b>{esc(head)}</b>\n{esc(body.strip()[:3500])}"
-                + (
-                    "\n\n👉 Ответьте работодателю сами — бот перевёл разговор в Telegram."
-                    if needs_human
-                    else ""
-                ),
-                silent=not needs_human,
+                "\n\n👉 Ответьте работодателю сами — бот перевёл разговор в Telegram."
             )
 
     def tick(self, now: float | None = None) -> None:

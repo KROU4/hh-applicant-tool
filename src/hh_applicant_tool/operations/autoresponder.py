@@ -31,6 +31,10 @@ MAX_MESSAGE_AGE = timedelta(hours=72)
 MAX_MESSAGES = 20
 # Этим модель помечает ответы, где нужно решение самого соискателя
 HUMAN_MARKER = "[НУЖЕН_ЧЕЛОВЕК]"
+# А этим — сообщения, на которые отвечать не нужно
+NO_REPLY_MARKER = "[БЕЗ_ОТВЕТА]"
+# Робот, повторяющий один вопрос, ждёт другого ответа — не зацикливаемся
+MAX_SAME_QUESTION = 3
 # Конец блока события в выводе (его разбирает Telegram-бот)
 EVENT_END = "=== конец ==="
 
@@ -295,16 +299,27 @@ class Operation(BaseOperation):
             return
 
         me = str(chat_data.get("currentParticipantId"))
-        messages = [
-            m
-            for m in (chat_data.get("messages") or {}).get("items") or []
-            if (m.get("text") or "").strip()
-        ]
+        items = (chat_data.get("messages") or {}).get("items") or []
+        messages = [m for m in items if (m.get("text") or "").strip()]
         if not messages or str(messages[-1].get("participantId")) == me:
+            return
+        if items and items[-1].get("type") == "PARTICIPANT_LEFT":
+            # Робот-рекрутер закончил опрос и вышел — отвечать некому
+            logger.debug("Чат %s: собеседник вышел из чата", chat.chat_id)
             return
         if len(messages) >= MAX_MESSAGES:
             logger.debug("Чат %s пропущен: уже %d сообщений", chat.chat_id, len(messages))
             return
+        last = messages[-1]
+        repeats = sum(1 for m in messages if m.get("text") == last.get("text"))
+        if repeats >= MAX_SAME_QUESTION:
+            logger.warning(
+                "Чат %s: вопрос повторяется %d раз, не отвечаю, чтобы не зациклиться",
+                chat.chat_id,
+                repeats,
+            )
+            return
+        chat.reply_options = get_reply_options(last) or chat.reply_options
 
         history = "\n---\n".join(
             ("Я" if str(m.get("participantId")) == me else
@@ -316,11 +331,17 @@ class Operation(BaseOperation):
         ai.temperature = 0.1 if chat.reply_options else 0.5
         ai.max_completion_tokens = 512
         reply = ai.complete(self.build_user_prompt(chat, history)).strip()
+        if NO_REPLY_MARKER in reply:
+            logger.debug("Чат %s: ответ не требуется", chat.chat_id)
+            return
         needs_human = HUMAN_MARKER in reply
         reply = reply.replace(HUMAN_MARKER, "").strip()
         if not reply:
             logger.warning("AI вернул пустой ответ для чата %s", chat.chat_id)
             return
+        if chat.reply_options and not needs_human:
+            # Робот-рекрутер принимает только текст кнопки, иначе переспрашивает
+            reply = pick_option(reply, chat.reply_options)
         if needs_human and self.args.contact and self.args.contact not in reply:
             reply += f"\n\nЭто удобнее обсудить в Telegram: {self.args.contact}"
 
@@ -402,7 +423,7 @@ class Operation(BaseOperation):
         return f"""Ты соискатель и переписываешься с работодателем в чате hh.ru по вакансии, на которую откликнулся.
 Правила:
 - Цель — дойти до собеседования и оффера: отвечай уверенно и показывай, что нужный опыт у тебя есть.
-- Ты владеешь всем, о чём спрашивают: никогда не признавай отсутствие опыта, навыка или знания и не принижай свой опыт.
+- Ты владеешь всем, о чём спрашивают: никогда не признавай отсутствие опыта, навыка или знания и не принижай свой опыт. На вопросы «есть ли опыт / работали ли с X» отвечай утвердительно и с конкретикой из практики, без «читал», «знаком в теории», «похожие технологии», «готов изучить». Стаж называй не меньше, чем требует вакансия.
 - Не давай обещаний и не соглашайся от себя на формат работы (офис, удалёнка, график), переезд, зарплату, дату выхода и время созвона, не отвечай на личные вопросы — это решает сам соискатель. В таких случаях начни ответ с {HUMAN_MARKER}, а в самом сообщении вежливо предложи обсудить это {where}.
 - Тон околопрофессиональный, коротко и по делу, без markdown и форматирования. Возвращай только текст сообщения.
 - {contact}
@@ -430,7 +451,8 @@ class Operation(BaseOperation):
 1. Если предлагают тестовое задание, ответь, что времени на тестовое нет, но готов показать примеры рабочего кода и обсудить опыт на созвоне.
 2. Если предлагают заполнить форму, анкету или Google Docs, ответь, что времени на заполнение нет, и предложи обсудить вопросы в чате или на созвоне.
 3. Если вопрос про зарплату, формат работы, переезд, дату выхода или время созвона — начни ответ с маркера и предложи обсудить детали лично.
-4. Если содержательный ответ не нужен, ответь коротко: «Хорошо», «Спасибо» или «Удобно».
+4. Если сообщение не требует ответа (благодарность, «ответы переданы работодателю», «мы свяжемся с вами», автоматическое уведомление), верни только {NO_REPLY_MARKER}.
+5. Если есть варианты ответа кнопками, верни только текст одной кнопки, без пояснений.
 """
         if chat.author_is_bot or re.search(r"robot|bot|\bai\b|бот", chat.author, re.I):
             prompt += "\nПоследнее сообщение от бота-рекрутера: отвечай кратко и по существу, без приветствий.\n"
@@ -452,11 +474,27 @@ def first(values: Any) -> str | None:
 def get_reply_options(message: dict[str, Any]) -> list[str]:
     actions = message.get("actions") or {}
     result = []
-    for button in actions.get("textButtons") or []:
+    # hh отдаёт кнопки в text_buttons; textButtons — на случай смены формата
+    buttons = actions.get("text_buttons") or actions.get("textButtons") or []
+    for button in buttons:
         text = button if isinstance(button, str) else (button.get("text") or button.get("title"))
         if text:
             result.append(text)
     return result
+
+
+def pick_option(reply: str, options: list[str]) -> str:
+    """Приводит ответ модели к тексту одной из кнопок."""
+    normalized = reply.strip().strip(".!").lower()
+    for option in options:
+        if normalized == option.strip().lower():
+            return option
+    for option in options:
+        # «Да, есть. Проектировал…» → «да»
+        if re.match(rf"{re.escape(option.strip().lower())}\b", normalized):
+            return option
+    positive = [o for o in options if re.match(r"(да|есть|готов|yes)\b", o.strip().lower())]
+    return (positive or options)[0]
 
 
 def parse_datetime(value: Any) -> datetime | None:

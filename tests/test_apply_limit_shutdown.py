@@ -237,3 +237,29 @@ def test_finalize_letter_strips_markdown():
     op.letter_contact = ""
     text = "## Опыт\n**LLM в проде.** Делал __RAG__.\n* пункт"
     assert op._finalize_letter(text) == "Опыт\nLLM в проде. Делал RAG.\n* пункт"
+
+
+class TestExcludedAndNetworkErrors:
+    def test_excluded_uses_api_and_network_error_skips_only_one_vacancy(self):
+        import requests
+
+        op = _make_operation(max_responses=0)
+        op.excluded_filter = r"php"
+
+        def api_get(url, *a, **k):
+            if url == "/vacancies/2":
+                return {"description": "<p>Нужен PHP</p>"}
+            if url == "/vacancies/3":
+                raise requests.ConnectionError("сеть упала")
+            return {"description": "Python"}
+
+        op.tool.api_client.get.side_effect = api_get
+        op._get_vacancies = lambda resume_id=None: iter(_make_vacancy(i) for i in range(1, 5))
+
+        resume = {"id": "r1", "title": "Dev", "alternate_url": "u"}
+        user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+        op._apply_resume(resume=resume, user=user, seen_employers=set())
+
+        # 1 и 4 — отклик; 2 — стоп-слово из API; 3 — сетевая ошибка, но прогон жив
+        assert op.tool.api_client.post.call_count == 2
+        assert not op.tool.session.get.called

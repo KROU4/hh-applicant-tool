@@ -561,10 +561,10 @@ def test_chat_events_are_forwarded_once(bot):
     bot.forward_chat_events()  # повторно ничего не шлём
 
     texts = [t for _, t, _ in bot.api.sent]
-    assert len(texts) == 2
+    # Обычные ответы не пересылаются — только где нужно решение владельца
+    assert len(texts) == 1
     assert texts[0].startswith("<b>🙋 Нужно ваше решение") and "Ответьте работодателю сами" in texts[0]
     assert "Какая зарплата?" in texts[0]
-    assert texts[1].startswith("<b>💬 Ответил в чате")
 
 
 def test_chat_events_after_log_recreated(bot):
@@ -572,8 +572,30 @@ def test_chat_events_after_log_recreated(bot):
     log.write_text("x" * 500, encoding="utf-8")
     bot.forward_chat_events()
     log.write_text(
-        "💬 Ответил в чате: «ML» — ТГТ\nhttps://hh.ru/vacancy/2\nОтвет: Ок\n=== конец ===\n",
+        "🙋 Нужно ваше решение: «ML» — ТГТ\nhttps://hh.ru/vacancy/2\nОтвет: Ок\n=== конец ===\n",
         encoding="utf-8",
     )
     bot.forward_chat_events()
     assert len(bot.api.sent) == 1
+
+
+def test_crashed_apply_run_counts_sent_responses(bot):
+    log = "🚀 Начинаю\n" + "📨 Отправили отклик на вакансию https://hh.ru/vacancy/1\n" * 44 + "[E] 403\n"
+    (bot.runner.logs_dir / "apply.log").write_text(log, encoding="utf-8")
+    task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies"])
+    bot._on_task_finish(task, 1)
+    assert bot.applied_24h() == 44
+
+
+def test_failed_apply_run_is_retried_while_quota_left(bot):
+    bot.state.set("schedule", "apply_enabled", True)
+    bot.state.set("runs", "applied_log", [[time.time() - 60, 44]])
+    (bot.runner.logs_dir / "apply.log").write_text("[E] 403 Client Error\n", encoding="utf-8")
+    task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies"])
+    before = time.time()
+
+    bot._on_task_finish(task, 1)
+
+    assert bot.state.last_run("apply_next") == pytest.approx(before + 1800, abs=5)
+    assert "повторю через 30 мин" in bot.api.sent[-1][1]
+    assert "Осталось 156" in bot.api.sent[-1][1]

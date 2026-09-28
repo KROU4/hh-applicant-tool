@@ -1342,6 +1342,14 @@ class Operation(BaseOperation):
                 logger.warning(ex)
             except (BadResponse, AIError) as ex:
                 logger.error(ex)
+            except requests.RequestException as ex:
+                # Сбой сети или защита сайта на одной вакансии не должны
+                # обрывать весь прогон
+                logger.error(
+                    "Сетевая ошибка на вакансии %s: %s",
+                    vacancy.get("alternate_url"),
+                    ex,
+                )
 
         logger.info(
             "Закончили рассылку откликов для резюме: %s (%s). Отправлено: %d",
@@ -1727,23 +1735,9 @@ class Operation(BaseOperation):
         if excluded_pat.search(vacancy_summary):
             return True
 
-        # Грузим полный текст вакансии только, если предыдущий фильтр не сработал
-        r = self.tool.session.get("https://hh.ru/vacancy/" + vacancy["id"])
-        r.raise_for_status()
-
-        # На странице вакансии поле description иногда встречается в двух
-        # вариантах верстки: `"description": "..."` и `"description":"..."`
-        # (без пробела после двоеточия) — учитываем оба.
-        description_match = re.search(r'"description":\s*(.*)', r.text)
-        if not description_match:
-            logger.warning(
-                "Не удалось найти описание вакансии на странице: %s",
-                vacancy["alternate_url"],
-            )
-            return False
-
-        description, _ = self.json_decoder.raw_decode(description_match.group(1))
-        description = strip_tags(description)
+        # Полный текст — только если сниппет не сработал. Берём из API:
+        # страница hh.ru/vacancy/… с сервера часто отвечает 403 (антибот)
+        description = self._vacancy_description(vacancy)
         logger.debug(description[:2047])
         return bool(excluded_pat.search(description))
 
