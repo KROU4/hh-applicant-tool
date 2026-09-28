@@ -103,6 +103,9 @@ APPLIED_RE = re.compile(r"Отправлено:\s*(\d+)")
 # Блоки тестовых откликов из вывода apply-vacancies --dry-run
 DRY_RUN_RE = re.compile(r"(🧪 Тест: .*?)\n=== конец ===", re.S)
 DRY_RUN_LIMIT = 5
+# События автоответчика (ответил / нужен человек) из его вывода
+CHAT_EVENT_END = "=== конец ===".encode()
+CHAT_EVENT_RE = re.compile(r"((?:🙋|💬)[^\n]*\n.*?)\n=== конец ===", re.S)
 
 INPUT_PROMPTS = {
     "search": "🔍 Пришлите поисковый запрос (например: <code>python разработчик</code>).\nПустой поиск = рекомендованные вакансии. «-» — очистить.",
@@ -320,6 +323,8 @@ class HHBot:
         self._ai_test_result: str | None = None
         self._account_cache: str | None = None
         self._resume_titles: dict[str, str] = {}
+        # Сколько байт лога автоответчика уже переслано владельцу
+        self._events_offset: int | None = None
 
     # ------------------------------------------------------------------ utils
 
@@ -1295,8 +1300,45 @@ class HHBot:
             return
         self.start_task("autoresponder", scheduled=True)
 
+    def forward_chat_events(self) -> None:
+        """Пересылает владельцу ответы автоответчика и вопросы, где нужен он сам."""
+        path = self.runner.logs_dir / "autoresponder.log"
+        if not path.exists():
+            return
+        size = path.stat().st_size
+        if self._events_offset is None or size < self._events_offset:
+            # Первый запуск бота — старое не шлём; файл пересоздан — читаем с нуля
+            self._events_offset = size if self._events_offset is None else 0
+            if size == self._events_offset:
+                return
+        with path.open("rb") as fp:
+            fp.seek(self._events_offset)
+            chunk = fp.read()
+        end = chunk.rfind(CHAT_EVENT_END)
+        if end < 0:
+            return
+        complete = chunk[: end + len(CHAT_EVENT_END)]
+        self._events_offset += len(complete)
+        text = ANSI_RE.sub("", complete.decode("utf-8", "replace"))
+        for block in CHAT_EVENT_RE.findall(text):
+            head, _, body = block.partition("\n")
+            needs_human = head.startswith("🙋")
+            self.notify(
+                f"<b>{esc(head)}</b>\n{esc(body.strip()[:3500])}"
+                + (
+                    "\n\n👉 Ответьте работодателю сами — бот перевёл разговор в Telegram."
+                    if needs_human
+                    else ""
+                ),
+                silent=not needs_human,
+            )
+
     def tick(self, now: float | None = None) -> None:
         now = now or time.time()
+        try:
+            self.forward_chat_events()
+        except OSError as ex:
+            logger.warning("Не удалось прочитать события автоответчика: %s", ex)
         sch = self.state.get("schedule")
         local = datetime.fromtimestamp(now, self.tz)
 

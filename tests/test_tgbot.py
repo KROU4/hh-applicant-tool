@@ -541,3 +541,39 @@ def test_dry_run_report_sends_each_letter(bot):
     assert "Пишу по вакансии." in texts[1]
     assert "&lt;b&gt;RAG&lt;/b&gt;" in texts[2]
     assert bot.applied_24h() == 0
+
+
+def test_chat_events_are_forwarded_once(bot):
+    log = bot.runner.logs_dir / "autoresponder.log"
+    log.write_text("старое событие\n", encoding="utf-8")
+    bot.forward_chat_events()  # первый проход: старое не пересылаем
+    assert bot.api.sent == []
+
+    with log.open("a", encoding="utf-8") as fp:
+        fp.write(
+            "🙋 Нужно ваше решение: «AI Engineer» — Лайфтех\nhttps://hh.ru/vacancy/1\n"
+            "Работодатель (Анна): Какая зарплата?\nОтвет: Обсудим в Telegram\n=== конец ===\n"
+            "💬 Ответил в чате: «ML» — ТГТ\nhttps://hh.ru/vacancy/2\n"
+            "Работодатель (Павел): Спасибо\nОтвет: Хорошо\n=== конец ===\n"
+            "💬 Ответил в чате: «незаконченный блок"
+        )
+    bot.forward_chat_events()
+    bot.forward_chat_events()  # повторно ничего не шлём
+
+    texts = [t for _, t, _ in bot.api.sent]
+    assert len(texts) == 2
+    assert texts[0].startswith("<b>🙋 Нужно ваше решение") and "Ответьте работодателю сами" in texts[0]
+    assert "Какая зарплата?" in texts[0]
+    assert texts[1].startswith("<b>💬 Ответил в чате")
+
+
+def test_chat_events_after_log_recreated(bot):
+    log = bot.runner.logs_dir / "autoresponder.log"
+    log.write_text("x" * 500, encoding="utf-8")
+    bot.forward_chat_events()
+    log.write_text(
+        "💬 Ответил в чате: «ML» — ТГТ\nhttps://hh.ru/vacancy/2\nОтвет: Ок\n=== конец ===\n",
+        encoding="utf-8",
+    )
+    bot.forward_chat_events()
+    assert len(bot.api.sent) == 1

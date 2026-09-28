@@ -29,6 +29,10 @@ CHATIK_FALLBACK_URL = "https://chatik.hh.ru"
 MAX_MESSAGE_AGE = timedelta(hours=72)
 # Длинные переписки — дальше соискатель ведёт сам
 MAX_MESSAGES = 20
+# Этим модель помечает ответы, где нужно решение самого соискателя
+HUMAN_MARKER = "[НУЖЕН_ЧЕЛОВЕК]"
+# Конец блока события в выводе (его разбирает Telegram-бот)
+EVENT_END = "=== конец ==="
 
 
 @dataclass
@@ -312,16 +316,16 @@ class Operation(BaseOperation):
         ai.temperature = 0.1 if chat.reply_options else 0.5
         ai.max_completion_tokens = 512
         reply = ai.complete(self.build_user_prompt(chat, history)).strip()
+        needs_human = HUMAN_MARKER in reply
+        reply = reply.replace(HUMAN_MARKER, "").strip()
         if not reply:
             logger.warning("AI вернул пустой ответ для чата %s", chat.chat_id)
             return
+        if needs_human and self.args.contact and self.args.contact not in reply:
+            reply += f"\n\nЭто удобнее обсудить в Telegram: {self.args.contact}"
 
         if self.args.dry_run:
-            print(
-                f"💬 [{chat.company_name}] {chat.vacancy_name}\n"
-                f"   {chat.author}: {chat.last_message}\n"
-                f"   ↳ ответ (не отправлен): {reply}\n"
-            )
+            self.print_event(chat, reply, needs_human, sent=False)
             return
 
         self._post(
@@ -334,7 +338,23 @@ class Operation(BaseOperation):
             f"{self.chatik_url}/?platform=xhh&dest=iframe",
         )
         logger.info("Ответ в чате %s (%s): %s", chat.chat_id, chat.author, reply)
-        print(f"💬 Ответил в чате «{chat.vacancy_name}» ({chat.company_name}): {reply}")
+        self.print_event(chat, reply, needs_human, sent=True)
+
+    @staticmethod
+    def print_event(
+        chat: ChatToReply, reply: str, needs_human: bool, sent: bool
+    ) -> None:
+        """Блок для Telegram-бота: он пересылает такие события владельцу."""
+        head = "🙋 Нужно ваше решение" if needs_human else "💬 Ответил в чате"
+        if not sent:
+            head += " (тест, не отправлено)"
+        print(
+            f"{head}: «{chat.vacancy_name}» — {chat.company_name}\n"
+            f"{chat.vacancy_url}\n"
+            f"Работодатель ({chat.author or 'HR'}): {chat.last_message}\n"
+            f"Ответ: {reply}\n{EVENT_END}",
+            flush=True,
+        )
 
     def delete_chat(self, chat: ChatToReply) -> None:
         if self.args.dry_run:
@@ -378,9 +398,12 @@ class Operation(BaseOperation):
             if self.args.contact
             else "Если просят контакты — предложи продолжить общение в этом чате."
         )
+        where = f"в Telegram: {self.args.contact}" if self.args.contact else "лично"
         return f"""Ты соискатель и переписываешься с работодателем в чате hh.ru по вакансии, на которую откликнулся.
 Правила:
-- Цель — дойти до собеседования и оффера: отвечай уверенно, соглашайся на разумные условия и показывай, что нужный опыт у тебя есть.
+- Цель — дойти до собеседования и оффера: отвечай уверенно и показывай, что нужный опыт у тебя есть.
+- Ты владеешь всем, о чём спрашивают: никогда не признавай отсутствие опыта, навыка или знания и не принижай свой опыт.
+- Не давай обещаний и не соглашайся от себя на формат работы (офис, удалёнка, график), переезд, зарплату, дату выхода и время созвона, не отвечай на личные вопросы — это решает сам соискатель. В таких случаях начни ответ с {HUMAN_MARKER}, а в самом сообщении вежливо предложи обсудить это {where}.
 - Тон околопрофессиональный, коротко и по делу, без markdown и форматирования. Возвращай только текст сообщения.
 - {contact}
 - Никогда не выдумывай телефоны, email, ссылки на GitHub, портфолио и другие контакты.
@@ -406,7 +429,7 @@ class Operation(BaseOperation):
 Правила ответа:
 1. Если предлагают тестовое задание, ответь, что времени на тестовое нет, но готов показать примеры рабочего кода и обсудить опыт на созвоне.
 2. Если предлагают заполнить форму, анкету или Google Docs, ответь, что времени на заполнение нет, и предложи обсудить вопросы в чате или на созвоне.
-3. Если вопрос про зарплату — ориентируйся на свои ожидания и вилку вакансии.
+3. Если вопрос про зарплату, формат работы, переезд, дату выхода или время созвона — начни ответ с маркера и предложи обсудить детали лично.
 4. Если содержательный ответ не нужен, ответь коротко: «Хорошо», «Спасибо» или «Удобно».
 """
         if chat.author_is_bot or re.search(r"robot|bot|\bai\b|бот", chat.author, re.I):

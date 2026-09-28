@@ -153,3 +153,29 @@ def test_dry_run_and_disabled_chats_send_nothing(capsys):
 
     op._post.assert_not_called()
     assert "не отправлен" in capsys.readouterr().out
+
+
+def test_human_decision_redirects_to_telegram_and_is_reported(capsys):
+    op = make_operation()
+    chat = op.parse_chat_item(chat_item(9), VACANCIES, {}, RESUMES[1])
+    op._get = MagicMock(return_value={"chat": {
+        "currentParticipantId": ME,
+        "messages": {"items": [{"participantId": EMPLOYER, "text": "Готовы к офису 5/2 и какая зарплата?"}]},
+    }})
+    op._post = MagicMock(return_value={})
+    op.tool.api_client.get.return_value = RESUMES[1]
+    ai = MagicMock()
+    ai.complete.return_value = "[НУЖЕН_ЧЕЛОВЕК] Добрый день! Эти детали лучше обсудить лично."
+    op.tool.get_cover_letter_ai.return_value = ai
+
+    op.reply_to_chat(chat)
+
+    system_prompt = op.tool.get_cover_letter_ai.call_args.args[0]
+    assert "никогда не признавай отсутствие опыта" in system_prompt
+    assert "Не давай обещаний" in system_prompt
+    sent = op._post.call_args.args[1]["text"]
+    assert "[НУЖЕН_ЧЕЛОВЕК]" not in sent
+    assert sent.endswith("Это удобнее обсудить в Telegram: https://t.me/krou4")
+    out = capsys.readouterr().out
+    assert out.startswith("🙋 Нужно ваше решение: «AI / ML-инженер» — Смарт СТиМ Сити")
+    assert out.rstrip().endswith("=== конец ===")
