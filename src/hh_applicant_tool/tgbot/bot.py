@@ -103,6 +103,10 @@ APPLIED_RE = re.compile(r"Отправлено:\s*(\d+)")
 
 INPUT_PROMPTS = {
     "search": "🔍 Пришлите поисковый запрос (например: <code>python разработчик</code>).\nПустой поиск = рекомендованные вакансии. «-» — очистить.",
+    "included_filter": "🎯 Пришлите ключевые слова через | (регулярное выражение), например:\n"
+    "<code>llm|rag|genai|ai[- ]?engineer|ai-инженер|агент</code>\n"
+    "Бот откликается только на вакансии, где есть совпадение в названии или описании. "
+    "Если «🔍 Поиск» пуст, запрос для hh соберётся из этих слов автоматически. «-» — очистить.",
     "excluded_filter": "🚫 Пришлите стоп-слова через | (регулярное выражение), например:\n<code>junior|стажир|bitrix|1с|php</code>\n«-» — очистить.",
     "max_responses": "🔢 Сколько откликов максимум за один запуск? Число, «-» — без лимита.",
     "system_prompt": "📝 Пришлите инструкцию для AI-писем (системный промпт).\nНапример: <i>Пиши кратко, по делу, упоминай опыт с Django</i>.\n«-» — вернуть стандартную.",
@@ -149,6 +153,50 @@ def in_hours(hour: int, start: int, end: int) -> bool:
     return hour >= start or hour < end
 
 
+def _split_alternatives(pattern: str) -> list[str]:
+    """Делит регулярку по «|» верхнего уровня (не внутри скобок)."""
+    parts, depth, current, escaped = [], 0, "", False
+    for ch in pattern:
+        if escaped:
+            current += ch
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            current += ch
+            continue
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        if ch == "|" and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += ch
+    parts.append(current)
+    return parts
+
+
+def regex_to_query(pattern: str) -> str:
+    """Поисковый запрос hh из регулярки: «llm|rag|ai engineer» →
+    «llm OR rag OR "ai engineer"». Части с символами регулярок в запрос не
+    попадают — их всё равно проверит фильтр --included-filter."""
+    words: list[str] = []
+    for alt in _split_alternatives(pattern.strip()):
+        # «ai[- ]?engineer», «ai\s*engineer» → «ai engineer»; \b не нужен
+        alt = re.sub(r"\[[- ]+\][?*]?|\\s[?*+]?|(?<=\w)-\?", " ", alt)
+        alt = alt.replace("\\b", "").strip()
+        if alt.startswith("(") and alt.endswith(")"):
+            # Группа целиком — разворачиваем её варианты
+            nested = regex_to_query(alt[1:-1].removeprefix("?:"))
+            words += nested.split(" OR ") if nested else []
+        elif alt and re.fullmatch(r"[\w\s.+#-]+", alt):
+            alt = " ".join(alt.split())
+            words.append(f'"{alt}"' if " " in alt else alt)
+    return " OR ".join(dict.fromkeys(words))
+
+
 def build_apply_args(settings: dict[str, Any], letter_path: Path) -> list[str]:
     args = ["apply-vacancies", "--ai-rate-limit", "20"]
     if settings.get("use_ai"):
@@ -163,8 +211,13 @@ def build_apply_args(settings: dict[str, Any], letter_path: Path) -> list[str]:
         args.append("--dry-run")
     if settings.get("send_email"):
         args.append("--send-email")
-    if settings.get("search"):
-        args.append(f"--search={settings['search']}")
+    search = settings.get("search") or regex_to_query(
+        settings.get("included_filter") or ""
+    )
+    if search:
+        args.append(f"--search={search}")
+    if settings.get("included_filter"):
+        args.append(f"--included-filter={settings['included_filter']}")
     if settings.get("excluded_filter"):
         args.append(f"--excluded-filter={settings['excluded_filter']}")
     if settings.get("max_responses"):
@@ -179,6 +232,8 @@ def build_apply_args(settings: dict[str, Any], letter_path: Path) -> list[str]:
         args.append(f"--letter-contact={settings['letter_contact']}")
     if settings.get("work_format"):
         args += ["--work-format", *settings["work_format"].split(",")]
+    if settings.get("search_in_name"):
+        args += ["--search-field", "name"]
     return args
 
 
@@ -534,7 +589,10 @@ class HHBot:
         lines = [
             "<b>⚙️ Настройки откликов</b>",
             "",
-            f"🔍 Поиск: {esc(s['search']) or '<i>рекомендованные вакансии</i>'}",
+            f"🔍 Поиск: {esc(s['search']) or '<i>из ключевых слов</i>' if not s['search'] and s.get('included_filter') else esc(s['search']) or '<i>рекомендованные вакансии</i>'}",
+            f"🎯 Ключевые слова (regex): {esc(s.get('included_filter') or '—')}",
+            f"🔤 Искать: {'только в названии' if s.get('search_in_name') else 'везде (название и описание)'}",
+            f"   запрос в hh: <code>{esc(s['search'] or regex_to_query(s.get('included_filter') or '') or '—')}</code>",
             f"🚫 Стоп-слова: {esc(s['excluded_filter']) or '—'}",
             f"📄 Резюме: {esc(s['resume_title'] or 'все опубликованные')}",
             f"🌍 Формат работы: {WORK_FORMAT_TITLES.get(s['work_format'], s['work_format'])}",
@@ -553,8 +611,15 @@ class HHBot:
         ]
         markup = keyboard(
             [
-                button("🔍 Поиск", "input:search"),
+                button("🎯 Ключевые слова", "input:included_filter"),
                 button("🚫 Стоп-слова", "input:excluded_filter"),
+            ],
+            [
+                button("🔍 Поиск", "input:search"),
+                button(
+                    "🔤 В названии ✅" if s.get("search_in_name") else "🔤 В названии ❌",
+                    "flip:search_in_name",
+                ),
             ],
             [
                 button("📄 Резюме", "screen:resumes"),
@@ -941,8 +1006,8 @@ class HHBot:
 
     def apply_input(self, key: str, text: str) -> str:
         clear = text in ("-", "—")
-        if key in ("search", "excluded_filter", "system_prompt", "letter_contact"):
-            if key == "excluded_filter" and not clear:
+        if key in ("search", "excluded_filter", "included_filter", "system_prompt", "letter_contact"):
+            if key in ("excluded_filter", "included_filter") and not clear:
                 try:
                     re.compile(text)
                 except re.error as ex:

@@ -98,6 +98,7 @@ class Namespace(BaseNamespace):
     per_page: int
     total_pages: int
     excluded_filter: str | None
+    included_filter: str | None
     max_responses: int
     send_email: bool
     skip_tests: bool
@@ -112,6 +113,8 @@ class Operation(BaseOperation):
     total_applied: int = 0
     # Контакт в конце AI-письма (например, ссылка на Telegram)
     letter_contact: str = ""
+    # Регулярка ключевых слов: без совпадения вакансия пропускается
+    included_filter: str | None = None
 
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument("--resume-id", help="Идентефикатор резюме")
@@ -200,6 +203,11 @@ class Operation(BaseOperation):
             "--excluded-filter",
             type=str,
             help=r"Исключить вакансии, если название или описание не соответствует шаблону. Например, `--excluded-filter 'junior|стажир|bitrix|дружн\w+ коллектив|полиграф|open\s*space|опенспейс|хакатон|конкурс|тестов\w+ задан'`",
+        )
+        parser.add_argument(
+            "--included-filter",
+            type=str,
+            help=r"Откликаться только на вакансии, где в названии или описании есть совпадение с шаблоном. Например, `--included-filter 'llm|rag|ai[- ]?engineer|genai'`",
         )
         parser.add_argument(
             "--max-responses",
@@ -362,6 +370,7 @@ class Operation(BaseOperation):
         self.employment = args.employment
         self.excluded_employer_id = args.excluded_employer_id
         self.excluded_filter = args.excluded_filter
+        self.included_filter = args.included_filter
         self.experience = args.experience
         self.force_message = args.force_message
         self.industry = args.industry
@@ -998,6 +1007,16 @@ class Operation(BaseOperation):
                     )
                     continue
 
+                if not self._is_included(vacancy):
+                    logger.info(
+                        "Вакансия не содержит ключевых слов: %s",
+                        vacancy["alternate_url"],
+                    )
+                    self._save_skipped_vacancy(
+                        vacancy, "included_filter", resume["id"]
+                    )
+                    continue
+
                 if self._is_excluded(vacancy):
                     logger.info(
                         "Вакансия попала под фильтр: %s",
@@ -1621,6 +1640,44 @@ class Operation(BaseOperation):
 
             if page >= res["pages"] - 1:
                 return
+
+    def _vacancy_summary(self, vacancy: SearchVacancy) -> str:
+        snippet = vacancy.get("snippet") or {}
+        return " ".join(
+            filter(
+                None,
+                [
+                    vacancy.get("name"),
+                    snippet.get("requirement"),
+                    snippet.get("responsibility"),
+                ],
+            )
+        )
+
+    def _vacancy_description(self, vacancy: SearchVacancy) -> str:
+        """Полный текст вакансии; кэш, чтобы оба фильтра не грузили его дважды."""
+        vacancy_id = str(vacancy["id"])
+        cache = self.__dict__.setdefault("_description_cache", {})
+        if vacancy_id not in cache:
+            try:
+                full = self.api_client.get(f"/vacancies/{vacancy_id}")
+                cache[vacancy_id] = strip_tags(
+                    full.get("description") or ""
+                ) + " " + " ".join(
+                    s.get("name", "") for s in full.get("key_skills") or []
+                )
+            except ApiError as ex:
+                logger.warning("Не удалось получить вакансию %s: %s", vacancy_id, ex)
+                cache[vacancy_id] = ""
+        return cache[vacancy_id]
+
+    def _is_included(self, vacancy: SearchVacancy) -> bool:
+        if not self.included_filter:
+            return True
+        pattern = re.compile(self.included_filter, re.IGNORECASE)
+        if pattern.search(self._vacancy_summary(vacancy)):
+            return True
+        return bool(pattern.search(self._vacancy_description(vacancy)))
 
     def _is_excluded(self, vacancy: SearchVacancy) -> bool:
         if not self.excluded_filter:

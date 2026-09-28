@@ -477,3 +477,37 @@ def test_letter_contact_is_passed_to_apply(bot, tmp_path):
     assert "--letter-contact=https://t.me/krou4" in args
     ns = HHApplicantTool()._parser.parse_args(args)
     assert ns.letter_contact == "https://t.me/krou4"
+
+
+@pytest.mark.parametrize(
+    "pattern, query",
+    [
+        ("llm|rag|ai engineer", 'llm OR rag OR "ai engineer"'),
+        ("llm|ai[- ]?engineer|ai-инженер", 'llm OR "ai engineer" OR ai-инженер'),
+        ("LLM|(agent|агент)", "LLM OR agent OR агент"),
+        (r"rag\b|c++", "rag OR c++"),
+    ],
+)
+def test_regex_to_query(pattern, query):
+    from hh_applicant_tool.tgbot.bot import regex_to_query
+
+    assert regex_to_query(pattern) == query
+
+
+def test_keywords_drive_search_and_filter(bot, tmp_path):
+    from hh_applicant_tool.main import HHApplicantTool
+
+    bot.handle_update(callback("input:included_filter"))
+    bot.handle_update(message("llm|rag|ai[- ]?engineer"))
+    bot.handle_update(callback("flip:search_in_name"))
+
+    args = build_apply_args(bot.state.get("apply"), tmp_path / "letter.txt")
+    ns = HHApplicantTool()._parser.parse_args(args)
+    assert ns.search == 'llm OR rag OR "ai engineer"'
+    assert ns.included_filter == "llm|rag|ai[- ]?engineer"
+    assert ns.search_field == ["name"]
+
+    # Явный поиск важнее автоматического
+    bot.state.set("apply", "search", "python")
+    args = build_apply_args(bot.state.get("apply"), tmp_path / "letter.txt")
+    assert HHApplicantTool()._parser.parse_args(args).search == "python"

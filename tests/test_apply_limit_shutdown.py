@@ -185,3 +185,29 @@ class TestCoverLetterPrompt:
         )
         kept = "Добрый день! Пишите: https://t.me/krou4"
         assert op._finalize_letter(kept) == kept
+
+
+class TestIncludedFilter:
+    def test_vacancies_without_keywords_are_skipped_not_blacklisted(self):
+        op = _make_operation(max_responses=0)
+        op.included_filter = r"llm|rag"
+        vacancies = [
+            {**_make_vacancy(1), "name": "LLM Engineer"},
+            {**_make_vacancy(2), "name": "Java QA"},
+            {**_make_vacancy(3), "name": "Python dev"},
+        ]
+        descriptions = {
+            "/vacancies/2": {"description": "<p>Тестирование на Java</p>"},
+            "/vacancies/3": {"description": "<p>Строим <b>RAG</b></p>"},
+        }
+        op.tool.api_client.get.side_effect = lambda url, *a, **k: descriptions.get(url, {})
+        op._get_vacancies = lambda resume_id=None: iter(vacancies)
+
+        resume = {"id": "r1", "title": "Dev", "alternate_url": "u"}
+        user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+        op._apply_resume(resume=resume, user=user, seen_employers=set())
+
+        applied = [c.args[0] for c in op.tool.api_client.post.call_args_list]
+        assert len(applied) == 2
+        # Без совпадения — просто пропуск, не чёрный список hh
+        assert not op.tool.api_client.put.called

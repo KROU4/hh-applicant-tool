@@ -21,6 +21,10 @@ DEFAULTS: dict[str, Any] = {
         "dry_run": False,
         "search": "",
         "excluded_filter": "",
+        # Регулярка ключевых слов: откликаемся только при совпадении
+        "included_filter": "",
+        # Искать только в названии вакансии (search_field=name)
+        "search_in_name": False,
         "max_responses": None,
         "resume_id": None,
         "resume_title": None,
