@@ -134,6 +134,7 @@ def test_reply_is_sent_with_contact_rules_and_bot_style():
 
 def test_dry_run_and_disabled_chats_send_nothing(capsys):
     op = make_operation(dry_run=True)
+    op.tool.api_client.get.return_value = RESUMES[0]
     chat = op.parse_chat_item(chat_item(8), VACANCIES, {}, RESUMES[0])
     op._post = MagicMock()
 
