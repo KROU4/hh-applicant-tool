@@ -35,6 +35,9 @@ if os.environ.get("OPENROUTER_API_KEY"):
 path.write_text(json.dumps(config, indent=2, ensure_ascii=False))
 EOF
 
+# Картинка приветствия по /start (свою можно положить поверх)
+[ -f "$CONFIG/welcome.jpg" ] || cp "$APP/deploy/telegram/welcome.jpg" "$CONFIG/welcome.jpg"
+
 chown -R hhbot:hhbot "$CONFIG"
 chmod 700 "$CONFIG"
 
