@@ -68,7 +68,9 @@ class TelegramAPI:
         try:
             payload = response.json()
         except ValueError:
-            raise TelegramError(method, response.text[:200], response.status_code)
+            raise TelegramError(
+                method, response.text[:200], response.status_code
+            ) from None
         if not payload.get("ok"):
             raise TelegramError(
                 method,

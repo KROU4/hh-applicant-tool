@@ -50,6 +50,11 @@ ruff = "^0.14.9"
 [tool.poetry.scripts]
 hh-applicant-tool = "hh_applicant_tool.main:main"
 
+# В корне лежат скрипты test_*.py, которые не являются тестами
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
 # Он заебал агриться на старый код, который был написан до появления агрессивной
 # проверки типов в pyright
 [tool.pyright]
