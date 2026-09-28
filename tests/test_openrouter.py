@@ -166,3 +166,89 @@ def test_tool_uses_openrouter_section(tmp_path):
     assert isinstance(client, ChatOpenRouter)
     assert client.models == ["x:free"]
     assert client.system_prompt == "system"
+
+
+def test_slow_failures_stop_after_deadline():
+    # Модели падают дольше, чем остывают: без проверки срока цикл вечный
+    session = FakeSession(
+        {
+            "a:free": [err(503, "down")] * 10,
+            "b:free": [err(503, "down")] * 10,
+        }
+    )
+    client = make(session, ["a:free", "b:free"])
+    STATE.cooldown_until.clear()
+
+    import hh_applicant_tool.ai.openrouter as orouter
+
+    original = orouter.COOLDOWN_ERROR
+    orouter.COOLDOWN_ERROR = 0.0
+    try:
+        with pytest.raises(OpenRouterError):
+            client.complete("привет")
+    finally:
+        orouter.COOLDOWN_ERROR = original
+    # Один полный круг по моделям, дальше — ошибка, а не бесконечный цикл
+    assert session.calls == ["a:free", "b:free"]
+
+
+def test_bad_request_cools_down_but_404_disables():
+    session = FakeSession(
+        {
+            "a:free": [err(400, "context length exceeded")],
+            "b:free": [err(404, "No endpoints found")],
+            "c:free": [ok("ok")],
+        }
+    )
+    client = make(session, ["a:free", "b:free", "c:free"])
+
+    assert client.complete("привет") == "ok"
+    assert "a:free" not in STATE.disabled
+    assert STATE.cooldown_until["a:free"] > 0
+    assert "b:free" in STATE.disabled
+
+
+def test_daily_limit_is_distinct_error():
+    from hh_applicant_tool.ai import OpenRouterDailyLimit
+
+    session = FakeSession(
+        {"a:free": [err(429, "Rate limit exceeded: free-models-per-day")]}
+    )
+    with pytest.raises(OpenRouterDailyLimit):
+        make(session, ["a:free"]).complete("привет")
+    # Повторный вызов даже не ходит в сеть
+    with pytest.raises(OpenRouterDailyLimit):
+        make(session, ["a:free"]).complete("привет")
+    assert session.calls == ["a:free"]
+
+
+def test_unclosed_think_is_stripped():
+    session = FakeSession(
+        {
+            "a:free": [ok("<think>обрезано на полуслове")],
+            "b:free": [ok("Письмо")],
+        }
+    )
+    assert make(session, ["a:free", "b:free"]).complete("x") == "Письмо"
+
+
+def test_empty_openai_section_key_does_not_hide_openrouter(tmp_path):
+    from hh_applicant_tool.main import HHApplicantTool
+    from hh_applicant_tool.utils import Config
+
+    tool = HHApplicantTool()
+    tool.openai_timeout = None
+    tool.openai_connect_timeout = None
+    tool.openai_proxy_url = None
+    tool.proxy_url = None
+    tool.__dict__["config"] = Config(tmp_path / "config.json")
+    tool.config.save(
+        openrouter={"api_key": "sk-or-test"},
+        openai_cover_letter={"api_key": "", "rate_limit": 40, "model": "gpt-4o"},
+    )
+
+    client = tool.get_cover_letter_ai("system")
+
+    assert isinstance(client, ChatOpenRouter)
+    assert client.api_key == "sk-or-test"
+    assert client.rate_limit == 20

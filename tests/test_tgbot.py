@@ -315,3 +315,90 @@ def test_in_hours_wraps_midnight():
 def test_summarize_log_prefers_markers():
     log = "a\nb\n\x1b[31m[E] Ошибка сети\x1b[0m\nc\n"
     assert summarize_log(log) == "[E] Ошибка сети"
+
+
+def test_normalize_letter_converts_placeholders_and_percent():
+    from hh_applicant_tool.tgbot.bot import normalize_letter
+    from hh_applicant_tool.utils.string import render_template
+
+    template = normalize_letter(
+        "{Здравствуйте|Добрый день}! Откликаюсь на {vacancy_name} в {employer_name}, готов на 100%."
+    )
+    text = render_template(
+        template.replace("{Здравствуйте|Добрый день}", "Здравствуйте"),
+        {"vacancy_name": "Python", "employer_name": "ООО Ромашка"},
+    )
+    assert text == "Здравствуйте! Откликаюсь на Python в ООО Ромашка, готов на 100%."
+
+
+def test_letter_with_unknown_placeholder_is_rejected(bot):
+    reply = bot.apply_input("letter", "Привет, %(salary)s")
+    assert reply.startswith("❌")
+    assert not bot.letter_path.exists()
+
+
+def test_refresh_token_code_2_is_success(bot):
+    task = bot.runner.start("refresh_token", "🔑", [], scheduled=True)
+    bot._on_task_finish(task, 2)
+    # Плановая успешная задача молчит
+    assert bot.api.sent == []
+
+
+def test_upload_config_does_not_override_server_keys(bot):
+    bot.api.files["f2"] = json.dumps(
+        {
+            "token": {"access_token": "pc"},
+            "openrouter": {"api_key": "sk-or-from-pc"},
+            "telegram_bot": {"token": "other"},
+        }
+    ).encode()
+    bot.handle_document(OWNER, {"file_id": "f2", "file_name": "config.json"})
+    cfg = bot.tool_config()
+    assert cfg["token"]["access_token"] == "pc"
+    assert cfg["openrouter"]["api_key"] == "sk-or-x"
+
+
+def test_telegram_falls_back_to_plain_text():
+    from hh_applicant_tool.tgbot.telegram import TelegramAPI
+
+    class Resp:
+        def __init__(self, payload):
+            self.payload = payload
+            self.status_code = 200
+            self.text = ""
+
+        def json(self):
+            return self.payload
+
+    class Session:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, url, json=None, **kw):
+            self.calls.append(json)
+            if json.get("parse_mode"):
+                return Resp(
+                    {
+                        "ok": False,
+                        "error_code": 400,
+                        "description": "Bad Request: can't parse entities",
+                    }
+                )
+            return Resp({"ok": True, "result": {}})
+
+    session = Session()
+    api = TelegramAPI("1:x", session=session)
+    api.send_message(1, "<b>Итог</b>\n<pre>a &lt; b</pre>")
+    assert session.calls[-1]["text"] == "Итог\na < b"
+    assert "parse_mode" not in session.calls[-1]
+
+    long_text = "<pre>" + "x" * 5000 + "</pre>"
+    api.send_message(1, long_text)
+    assert len(session.calls[-1]["text"]) <= 4096
+
+
+def test_redact_hides_bot_token():
+    from hh_applicant_tool.tgbot.telegram import redact
+
+    msg = "HTTPSConnectionPool: /bot123456:AA-bb_cc/getUpdates timed out"
+    assert "AA-bb_cc" not in redact(msg)

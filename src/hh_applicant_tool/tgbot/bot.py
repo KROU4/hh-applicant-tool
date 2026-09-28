@@ -20,9 +20,10 @@ import requests
 
 from ..constants import CONFIG_FILENAME, DATABASE_FILENAME, LOG_FILENAME
 from ..utils.config import Config
+from ..utils.string import rand_text, render_template
 from .runner import Task, TaskRunner
 from .state import BotState
-from .telegram import TelegramAPI, TelegramError, button, keyboard
+from .telegram import TelegramAPI, TelegramError, button, keyboard, redact
 
 logger = logging.getLogger(__package__)
 
@@ -86,11 +87,15 @@ SUMMARY_MARKERS = (
 )
 AUTH_MARKERS = (
     "Требуется авторизация",
+    "Авторизация истекла",
     "invalid_grant",
-    "token",
-    "Forbidden",
     "bad_authorization",
+    "token_revoked",
+    "token_expired",
 )
+SERVER_CONFIG_KEYS = ("openrouter", "telegram_bot", "proxy_url")
+# refresh-token возвращает 2, если токен ещё действителен
+SUCCESS_CODES = {"refresh_token": (0, 2)}
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 APPLIED_RE = re.compile(r"Отправлено:\s*(\d+)")
 
@@ -99,7 +104,9 @@ INPUT_PROMPTS = {
     "excluded_filter": "🚫 Пришлите стоп-слова через | (регулярное выражение), например:\n<code>junior|стажир|bitrix|1с|php</code>\n«-» — очистить.",
     "max_responses": "🔢 Сколько откликов максимум за один запуск? Число, «-» — без лимита.",
     "system_prompt": "📝 Пришлите инструкцию для AI-писем (системный промпт).\nНапример: <i>Пиши кратко, по делу, упоминай опыт с Django</i>.\n«-» — вернуть стандартную.",
-    "letter": "✉️ Пришлите шаблон письма (используется, когда AI-письма выключены).\nМожно использовать {vacancy_name}, {employer_name}, {first_name}. Варианты через {Привет|Здравствуйте}.",
+    "letter": "✉️ Пришлите шаблон письма (используется, когда AI-письма выключены).\n"
+    "Подстановки: {vacancy_name}, {employer_name}, {first_name}, {last_name}, {phone}, {email}, {resume_url}.\n"
+    "Случайный вариант: {Здравствуйте|Добрый день}.",
     "hours": "🕘 Пришлите часы работы автооткликов в формате <code>9-21</code>.",
     "openrouter_key": "🔑 Пришлите ключ OpenRouter (sk-or-...).",
 }
@@ -169,6 +176,37 @@ def build_apply_args(settings: dict[str, Any], letter_path: Path) -> list[str]:
     return args
 
 
+LETTER_PLACEHOLDERS = (
+    "vacancy_name",
+    "vacancy_url",
+    "employer_name",
+    "first_name",
+    "last_name",
+    "email",
+    "phone",
+    "resume_title",
+    "resume_url",
+    "resume_hash",
+)
+
+
+def normalize_letter(text: str) -> str:
+    """Переводит {vacancy_name} в %(vacancy_name)s и проверяет шаблон.
+
+    В утилите фигурные скобки означают случайный выбор, а подстановки идут
+    через %-форматирование, поэтому одиночный «%» тоже нужно экранировать.
+    """
+    for name in LETTER_PLACEHOLDERS:
+        text = text.replace("{" + name + "}", f"%({name})s")
+    text = re.sub(r"%(?!\(\w+\)s)", "%%", text)
+    render_template(
+        rand_text(text),
+        {name: "x" for name in LETTER_PLACEHOLDERS},
+        "шаблоне письма",
+    )
+    return text
+
+
 def summarize_log(text: str, limit: int = 12) -> str:
     lines = [ANSI_RE.sub("", line).rstrip() for line in text.splitlines()]
     lines = [line for line in lines if line.strip()]
@@ -196,7 +234,9 @@ class HHBot:
         self.runner = runner or TaskRunner(config_path, self._on_task_finish)
         self.letter_path = config_path / "letter.txt"
         self.pending_input: dict[int, str] = {}
-        self._pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="tg")
+        # Один поток: апдейты обрабатываются строго по порядку (нажали «Поиск» →
+        # прислали текст). Медленное уходит в _background.
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tg")
         self._stop = threading.Event()
         self._ai_test_result: str | None = None
         self._account_cache: str | None = None
@@ -226,7 +266,7 @@ class HHBot:
         try:
             self.api.send_message(owner, text, markup, silent=silent)
         except (TelegramError, requests.RequestException) as ex:
-            logger.warning("Не удалось отправить уведомление: %s", ex)
+            logger.warning("Не удалось отправить уведомление: %s", redact(ex))
 
     # --------------------------------------------------------------- polling
 
@@ -241,7 +281,7 @@ class HHBot:
                 ]
             )
         except (TelegramError, requests.RequestException) as ex:
-            logger.warning("setMyCommands: %s", ex)
+            logger.warning("setMyCommands: %s", redact(ex))
 
         threading.Thread(
             target=self._scheduler_loop, name="scheduler", daemon=True
@@ -255,7 +295,7 @@ class HHBot:
             try:
                 updates = self.api.get_updates(offset)
             except (TelegramError, requests.RequestException) as ex:
-                logger.warning("getUpdates: %s", ex)
+                logger.warning("getUpdates: %s", redact(ex))
                 self._stop.wait(5)
                 continue
             for update in updates:
@@ -271,6 +311,17 @@ class HHBot:
             self.handle_update(update)
         except Exception:
             logger.exception("Ошибка обработки апдейта")
+
+    def _background(self, fn: Callable[[], None]) -> None:
+        """Долгие действия (whoami, тест AI, остановка) не держат очередь."""
+
+        def _run() -> None:
+            try:
+                fn()
+            except Exception:
+                logger.exception("Ошибка фонового действия")
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _authorized(self, user_id: int, chat_id: int, text: str) -> bool:
         owner = self.state.owner_id
@@ -337,11 +388,14 @@ class HHBot:
         elif command == "/stop":
             stopped = [t.title for t in self.runner.running_tasks()]
             self.state.set("schedule", "autoresponder_enabled", False)
-            self.runner.stop_all()
+            self.state.set("schedule", "apply_enabled", False)
             self.api.send_message(
                 chat_id,
-                "⏹ Остановлено: " + (", ".join(stopped) or "ничего не работало"),
+                "⏹ Останавливаю: "
+                + (", ".join(stopped) or "ничего не работало")
+                + "\nАвтоотклики и автоответчик выключены.",
             )
+            self._background(self.runner.stop_all)
         elif command == "/log":
             self.send_log(chat_id, "apply")
         elif command == "/cancel":
@@ -728,9 +782,12 @@ class HHBot:
         answer: str | None = None
 
         if action == "screen":
-            self.api.answer_callback(
-                query["id"], "Загружаю…" if arg == "resumes" else None
-            )
+            if arg == "resumes":
+                # Список резюме — отдельный процесс и запрос к API, это секунды
+                self.api.answer_callback(query["id"], "Загружаю…")
+                self._background(lambda: self.show(chat_id, message_id, arg))
+                return
+            self.api.answer_callback(query["id"])
             self.show(chat_id, message_id, arg)
             return
 
@@ -805,20 +862,28 @@ class HHBot:
                 answer = "Лог пока пуст"
         elif action == "ai" and arg == "test":
             self.api.answer_callback(query["id"], "Генерирую, это 5–30 секунд…")
-            self._ai_test_result = self.run_ai_test()
-            self.show(chat_id, message_id, "ai")
+
+            def _test() -> None:
+                self._ai_test_result = self.run_ai_test()
+                self.show(chat_id, message_id, "ai")
+
+            self._background(_test)
             return
         elif action == "account" and arg == "whoami":
             self.api.answer_callback(query["id"], "Проверяю…")
-            code, out, err = self.runner.run_sync(["whoami"])
-            text = out if code == 0 and out else (err or out)
-            self._account_cache = (
-                ("✅ " if code == 0 and out else "❌ ")
-                + "<pre>"
-                + esc(ANSI_RE.sub("", text)[-800:])
-                + "</pre>"
-            )
-            self.show(chat_id, message_id, "account")
+
+            def _whoami() -> None:
+                code, out, err = self.runner.run_sync(["whoami"])
+                text = out if code == 0 and out else (err or out)
+                self._account_cache = (
+                    ("✅ " if code == 0 and out else "❌ ")
+                    + "<pre>"
+                    + esc(ANSI_RE.sub("", text)[-800:])
+                    + "</pre>"
+                )
+                self.show(chat_id, message_id, "account")
+
+            self._background(_whoami)
             return
 
         self.api.answer_callback(query["id"], answer)
@@ -861,7 +926,11 @@ class HHBot:
             if clear:
                 self.letter_path.unlink(missing_ok=True)
                 return "✅ Шаблон удалён"
-            self.letter_path.write_text(text, encoding="utf-8")
+            try:
+                template = normalize_letter(text)
+            except (ValueError, TypeError) as ex:
+                return f"❌ Ошибка в шаблоне: {esc(ex)}"
+            self.letter_path.write_text(template, encoding="utf-8")
             return "✅ Шаблон сохранён"
         if key == "hours":
             match = re.fullmatch(r"\s*(\d{1,2})\s*[-–]\s*(\d{1,2})\s*", text)
@@ -892,10 +961,14 @@ class HHBot:
                 self.api.send_message(chat_id, f"❌ Не JSON: {esc(ex)}")
                 return
             cfg = self.tool_config()
-            # Ключ OpenRouter и прочие настройки сервера не затираем
-            if "openrouter" in cfg and "openrouter" not in uploaded:
-                uploaded.pop("openrouter", None)
+            # Настройки, относящиеся к серверу, конфигом с ПК не затираем
+            for key in SERVER_CONFIG_KEYS:
+                if key in cfg:
+                    uploaded.pop(key, None)
             cfg.save(uploaded)
+            # Автоответчик держит старый токен в памяти и при выходе записал бы
+            # его обратно — перезапускаем, планировщик поднимет его снова
+            self.runner.stop("autoresponder")
             has_token = bool((uploaded.get("token") or {}).get("access_token"))
             self.api.send_message(
                 chat_id,
@@ -907,8 +980,8 @@ class HHBot:
             (self.config_path / "cookies.txt").write_bytes(content)
             self.api.send_message(chat_id, "✅ cookies.txt загружен")
         elif name.endswith(".txt"):
-            self.letter_path.write_bytes(content)
-            self.api.send_message(chat_id, "✅ Шаблон письма загружен")
+            reply = self.apply_input("letter", content.decode("utf-8", "replace"))
+            self.api.send_message(chat_id, reply)
         else:
             self.api.send_message(
                 chat_id,
@@ -981,7 +1054,10 @@ class HHBot:
         return "Запущено"
 
     def _on_task_finish(self, task: Task, code: int) -> None:
-        log = self.runner.tail(task.name, 400)
+        # Весь лог: при нескольких резюме итоги первых уходят далеко вверх
+        log = self.runner.tail(task.name, 100_000)
+        if code in SUCCESS_CODES.get(task.name, (0,)):
+            code = 0
         applied = 0
         if task.name == "apply":
             applied = sum(int(n) for n in APPLIED_RE.findall(log))

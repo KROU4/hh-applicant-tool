@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import html
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,27 @@ def clip(text: str, limit: int = MAX_MESSAGE_LENGTH) -> str:
     if len(text) <= limit:
         return text
     return "…" + text[-(limit - 1) :]
+
+
+def plain(text: str) -> str:
+    """HTML → обычный текст: запасной вариант, если разметку не приняли."""
+    return clip(html.unescape(_TAG_RE.sub("", text)))
+
+
+_TAG_RE = re.compile(r"</?(?:b|i|code|pre|a)(?:\s[^>]*)?>")
+_TOKEN_RE = re.compile(r"bot\d+:[\w-]+")
+
+
+def redact(text: object) -> str:
+    """Убирает токен бота из текста ошибок requests (он есть в URL)."""
+    return _TOKEN_RE.sub("bot<token>", str(text))
+
+
+def _markup_rejected(ex: "TelegramError") -> bool:
+    return any(
+        s in ex.description.lower()
+        for s in ("can't parse entities", "message is too long", "text is too long")
+    )
 
 
 class TelegramAPI:
@@ -96,15 +119,21 @@ class TelegramAPI:
         *,
         silent: bool = False,
     ) -> dict:
-        return self.call(
-            "sendMessage",
+        params = dict(
             chat_id=chat_id,
-            text=clip(text),
-            parse_mode="HTML",
             reply_markup=reply_markup,
             disable_web_page_preview=True,
             disable_notification=silent or None,
         )
+        if len(text) <= MAX_MESSAGE_LENGTH:
+            try:
+                return self.call(
+                    "sendMessage", text=text, parse_mode="HTML", **params
+                )
+            except TelegramError as ex:
+                if not _markup_rejected(ex):
+                    raise
+        return self.call("sendMessage", text=plain(text), **params)
 
     def edit_message(
         self,
@@ -113,16 +142,23 @@ class TelegramAPI:
         text: str,
         reply_markup: dict | None = None,
     ) -> None:
+        params = dict(
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
         try:
-            self.call(
-                "editMessageText",
-                chat_id=chat_id,
-                message_id=message_id,
-                text=clip(text),
-                parse_mode="HTML",
-                reply_markup=reply_markup,
-                disable_web_page_preview=True,
-            )
+            try:
+                if len(text) > MAX_MESSAGE_LENGTH:
+                    raise TelegramError("editMessageText", "message is too long")
+                self.call(
+                    "editMessageText", text=text, parse_mode="HTML", **params
+                )
+            except TelegramError as ex:
+                if not _markup_rejected(ex):
+                    raise
+                self.call("editMessageText", text=plain(text), **params)
         except TelegramError as ex:
             # Нажали ту же кнопку ещё раз — текст не изменился, это не ошибка
             if "message is not modified" not in ex.description:
@@ -131,8 +167,8 @@ class TelegramAPI:
     def answer_callback(self, callback_id: str, text: str | None = None) -> None:
         try:
             self.call("answerCallbackQuery", callback_query_id=callback_id, text=text)
-        except TelegramError as ex:
-            logger.debug("answerCallbackQuery: %s", ex)
+        except (TelegramError, requests.RequestException) as ex:
+            logger.debug("answerCallbackQuery: %s", redact(ex))
 
     def send_document(
         self, chat_id: int, path: Path, caption: str | None = None

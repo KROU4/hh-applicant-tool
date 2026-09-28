@@ -370,7 +370,11 @@ class HHApplicantTool(MegaTool):
         if self.api_client.access_token != self.config.get("token", {}).get(
             "access_token"
         ):
-            self.config.save(token=self.api_client.get_access_token())
+            token = self.api_client.get_access_token()
+            # Файл перечитываем: его могли изменить параллельные процессы
+            # (Telegram-бот, другие операции), а снимок в памяти устарел
+            utils.Config(self.config_path / CONFIG_FILENAME).save(token=token)
+            self.config["token"] = token
             return True
         return False
 
@@ -414,8 +418,15 @@ class HHApplicantTool(MegaTool):
         if c.get("provider") == "openrouter" or (
             not c.get("api_key") and openrouter_config.get("api_key")
         ):
+            # Из секции цели берём только то, что имеет смысл для роутера;
+            # model/base_url/rate_limit там настроены под другого провайдера
+            overrides = {
+                k: c[k]
+                for k in ("models", "temperature", "max_completion_tokens")
+                if c.get(k) not in (None, "", [])
+            }
             return self._init_openrouter_client(
-                system_prompt, {**openrouter_config, **c}
+                system_prompt, {**openrouter_config, **overrides}
             )
 
         api_key = c.get("api_key")

@@ -50,16 +50,29 @@ DEFAULT_VISION_MODELS: tuple[str, ...] = (
 
 # Бесплатные модели, которые не стоит подбирать автоматически
 _AUTO_EXCLUDE = re.compile(r"safety|guard|code|coder|-fin|-sante|lfm|inkling", re.I)
-_THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
+# Незакрытый <think> — ответ обрезан посреди рассуждений
+_THINK_RE = re.compile(r"<think>.*?(?:</think>|$)", re.S | re.I)
+# Ошибки, после которых модель бесполезна до перезапуска
+_PERMANENT_RE = re.compile(
+    r"agentic harness|not a valid model|no endpoints|not enabled|does not exist",
+    re.I,
+)
 
 # Сколько модель отдыхает после ошибки, секунды
 COOLDOWN_RATE_LIMIT = 90.0
 COOLDOWN_ERROR = 45.0
+COOLDOWN_REJECTED = 1800.0
 CATALOG_TTL = 3600.0
+# Лимит бесплатных моделей общий на аккаунт: 20 запросов в минуту
+FREE_MIN_INTERVAL = 60.0 / 20
 
 
 class OpenRouterError(OpenAIError):
     pass
+
+
+class OpenRouterDailyLimit(OpenRouterError):
+    """Дневной лимит бесплатных запросов исчерпан — дальше пробовать бессмысленно."""
 
 
 class _RouterState:
@@ -67,6 +80,8 @@ class _RouterState:
 
     def __init__(self) -> None:
         self.lock = Lock()
+        self.request_lock = Lock()
+        self.previous_request_at: float = 0.0
         self.cooldown_until: dict[str, float] = {}
         self.disabled: dict[str, str] = {}
         self.daily_limit_until: float = 0.0
@@ -77,6 +92,7 @@ class _RouterState:
 
     def reset(self) -> None:
         with self.lock:
+            self.previous_request_at = 0.0
             self.cooldown_until.clear()
             self.disabled.clear()
             self.daily_limit_until = 0.0
@@ -114,6 +130,36 @@ class ChatOpenRouter(ChatOpenAI):
             "HTTP-Referer": "https://github.com/s3rgeym/hh-applicant-tool",
             "X-Title": "hh-applicant-tool",
         }
+
+    @property
+    def _min_request_interval(self) -> float:
+        # rate_limit может задать только более редкие запросы, чем разрешает
+        # OpenRouter (apply-vacancies выставляет 40 из --ai-rate-limit)
+        if self.rate_limit <= 0:
+            return 0.0
+        return max(60.0 / self.rate_limit, FREE_MIN_INTERVAL)
+
+    def _request(self, payload: dict) -> requests.Response:
+        """Как у ChatOpenAI, но интервал общий для всех клиентов процесса."""
+        with STATE.request_lock:
+            delay = (
+                self._min_request_interval
+                - time.monotonic()
+                + STATE.previous_request_at
+            )
+            if STATE.previous_request_at and delay > 0:
+                time.sleep(delay)
+            try:
+                return self.session.post(
+                    self.base_url,
+                    json=payload,
+                    headers=self._default_headers(),
+                    timeout=Timeout(
+                        connect=self.connect_timeout, total=self.timeout
+                    ),
+                )
+            finally:
+                STATE.previous_request_at = time.monotonic()
 
     # --- каталог моделей ---
 
@@ -211,14 +257,21 @@ class ChatOpenRouter(ChatOpenAI):
         temperature: float,
     ) -> str:
         if STATE.daily_limit_until > time.time():
-            raise OpenRouterError(
+            raise OpenRouterDailyLimit(
                 "Дневной лимит бесплатных запросов OpenRouter исчерпан"
             )
 
         deadline = time.monotonic() + self.max_wait
         last_error = "нет доступных моделей"
+        attempts = 0
 
         while True:
+            # Медленные падения (таймауты по 90с) могут идти по кругу вечно,
+            # если проверять срок только когда все модели остывают
+            if attempts and time.monotonic() >= deadline:
+                raise OpenRouterError(
+                    f"Все модели OpenRouter заняты или отвечают ошибкой: {last_error}"
+                )
             candidates = [
                 m
                 for m in self._candidates(vision=vision)
@@ -245,6 +298,7 @@ class ChatOpenRouter(ChatOpenAI):
                 continue
 
             for model in ready:
+                attempts += 1
                 result = self._try_model(
                     model,
                     messages,
@@ -324,17 +378,29 @@ class ChatOpenRouter(ChatOpenAI):
             raise OpenRouterError(f"Неверный ключ OpenRouter: {message}")
         if status == 402:
             raise OpenRouterError(f"OpenRouter требует оплату: {message}")
-        if status == 429 and "per-day" in f"{message} {raw}".lower():
+        details = f"{message} {raw}".lower()
+        if status == 429 and "per-day" in details:
             STATE.daily_limit_until = time.time() + 3600
-            raise OpenRouterError(
+            raise OpenRouterDailyLimit(
                 f"Дневной лимит бесплатных запросов OpenRouter: {message}"
             )
+        if status == 429 and "per-min" in details:
+            # Лимит аккаунта, а не модели: ждём, а не жжём остальные модели
+            wait = self._retry_after(response) or 60.0
+            logger.info("Лимит OpenRouter в минуту, жду %.0fс", wait)
+            time.sleep(wait)
+            return self._Attempt(error=text)
         if status == 429:
             wait = self._retry_after(response) or COOLDOWN_RATE_LIMIT
             self._cool_down(model, wait, "перегружена (429)")
             return self._Attempt(error=text)
-        if status in (400, 403, 404) and not _is_transient(message):
+        if status == 404 or _PERMANENT_RE.search(details):
             self._disable(model, text[:200])
+            return self._Attempt(error=text)
+        if status in (400, 403) and not _is_transient(message):
+            # Может относиться к конкретному запросу (длина контекста,
+            # модерация) — надолго откладываем, но не выключаем совсем
+            self._cool_down(model, COOLDOWN_REJECTED, text[:200])
             return self._Attempt(error=text)
 
         self._cool_down(model, COOLDOWN_ERROR, text[:200])
@@ -383,7 +449,9 @@ class ChatOpenRouter(ChatOpenAI):
             },
         ]
         text = self._chat(messages, vision=True, max_tokens=20, temperature=0.0)
-        return text.strip().split()[0] if text.strip() else ""
+        # Модели иногда отвечают «Текст: abc12» — берём последнее слово
+        words = text.strip().split()
+        return words[-1] if words else ""
 
 
 def _is_transient(message: str) -> bool:

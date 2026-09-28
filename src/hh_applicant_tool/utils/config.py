@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import platform
 from functools import cache
 from os import getenv
@@ -38,16 +39,20 @@ class Config(dict):
     def save(self, *args: Any, **kwargs: Any) -> None:
         self.update(*args, **kwargs)
         self._config_path.parent.mkdir(exist_ok=True, parents=True)
+        # Пишем во временный файл и подменяем: параллельный читатель
+        # никогда не увидит наполовину записанный конфиг
+        tmp_path = self._config_path.with_name(
+            f".{self._config_path.name}.{os.getpid()}.tmp"
+        )
         with self._lock:
-            with self._config_path.open(
-                "w+", encoding="utf-8", errors="replace"
-            ) as fp:
+            with tmp_path.open("w", encoding="utf-8", errors="replace") as fp:
                 json.dump(
                     self,
                     fp,
                     indent=2,
                     sort_keys=True,
                 )
+            os.replace(tmp_path, self._config_path)
 
     __getitem__ = dict.get
 

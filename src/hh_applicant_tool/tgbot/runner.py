@@ -34,6 +34,9 @@ class Task:
     started_at: float = field(default_factory=time.time)
     scheduled: bool = False
     stopped_by_user: bool = False
+    # Выставляется после обработки завершения: до этого лог ещё читают,
+    # и новый запуск той же задачи не должен его перезаписать
+    done: bool = False
 
     @property
     def elapsed(self) -> float:
@@ -121,10 +124,13 @@ class TaskRunner:
             self.on_finish(task, code)
         except Exception:
             logger.exception("Ошибка обработчика завершения задачи")
+        finally:
+            with self._lock:
+                task.done = True
 
     def _is_alive(self, name: str) -> bool:
         task = self._tasks.get(name)
-        return task is not None and task.proc.poll() is None
+        return task is not None and not task.done
 
     def running(self, name: str) -> bool:
         with self._lock:
@@ -170,8 +176,16 @@ class TaskRunner:
         return True
 
     def stop_all(self) -> None:
-        for task in self.running_tasks():
-            self.stop(task.name, wait=True)
+        """Останавливает всё параллельно и ждёт: операции успеют сохранить токен."""
+        tasks = self.running_tasks()
+        for task in tasks:
+            self.stop(task.name)
+        deadline = time.monotonic() + STOP_GRACE_SECONDS * 2 + 5
+        for task in tasks:
+            try:
+                task.proc.wait(max(deadline - time.monotonic(), 0.1))
+            except subprocess.TimeoutExpired:
+                task.proc.kill()
 
     def tail(self, name: str, lines: int = 40) -> str:
         path = self.logs_dir / f"{name}.log"

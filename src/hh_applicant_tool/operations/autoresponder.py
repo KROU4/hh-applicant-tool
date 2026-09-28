@@ -122,6 +122,13 @@ class Operation(BaseOperation):
       except Exception:
         logger.exception("Ошибка автоответчика")
 
+      # Автоответчик живёт часами: обновлённый токен сохраняем сразу, иначе
+      # другие процессы попробуют уже использованный refresh_token
+      try:
+        tool.save_token()
+      except Exception:
+        logger.exception("Не удалось сохранить токен")
+
       cancel_event.wait(args.interval)
 
     logger.info("Автоответчик остановлен")

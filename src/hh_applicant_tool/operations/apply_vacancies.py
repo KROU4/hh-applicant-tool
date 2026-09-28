@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 import requests
 
 from ..ai.base import AIError
+from ..ai.openrouter import OpenRouterDailyLimit
 from ..api import BadResponse, Redirect, datatypes
 from ..api.datatypes import PaginatedItems, SearchVacancy
 from ..api.errors import ApiError, CaptchaRequired, LimitExceeded
@@ -531,6 +532,10 @@ class Operation(BaseOperation):
                 )
                 continue
 
+            except OpenRouterDailyLimit as e:
+                # Без фильтра откликнулись бы на всё подряд
+                logger.error("AI %s недоступен, вакансия пропущена: %s", log_suffix, e)
+                return False
             except AIError as e:
                 # ChatOpenAI уже делает retry для 429, поэтому здесь только логируем
                 logger.error("Ошибка AI %s: %s", log_suffix, e)
