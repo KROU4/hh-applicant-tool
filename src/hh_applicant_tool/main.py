@@ -409,7 +409,15 @@ class HHApplicantTool(MegaTool):
         
         config_section = config_sections[purpose]
         c = self.config.get(config_section, {})
-        
+
+        openrouter_config = self.config.get("openrouter") or {}
+        if c.get("provider") == "openrouter" or (
+            not c.get("api_key") and openrouter_config.get("api_key")
+        ):
+            return self._init_openrouter_client(
+                system_prompt, {**openrouter_config, **c}
+            )
+
         api_key = c.get("api_key")
         if not api_key:
             raise ValueError(
@@ -457,6 +465,39 @@ class HHApplicantTool(MegaTool):
                 or DEFAULT_OPENAI_CONNECT_TIMEOUT
             ),
             session=self.openai_session,
+        )
+
+    def _init_openrouter_client(
+        self, system_prompt: str, c: dict
+    ) -> ai.ChatOpenRouter:
+        """Роутер по бесплатным моделям OpenRouter (секция `openrouter`)."""
+        if not c.get("api_key"):
+            raise ValueError("Не задан 'openrouter.api_key' в конфиге")
+
+        options = {
+            key: c[key]
+            for key in (
+                "models",
+                "vision_models",
+                "auto_discover",
+                "max_wait",
+                "rate_limit",
+                "temperature",
+                "max_completion_tokens",
+            )
+            if c.get(key) is not None
+        }
+        return ai.ChatOpenRouter(
+            api_key=c["api_key"],
+            system_prompt=system_prompt,
+            connect_timeout=(
+                self.openai_connect_timeout
+                or c.get("connect_timeout")
+                or DEFAULT_OPENAI_CONNECT_TIMEOUT
+            ),
+            timeout=self.openai_timeout or c.get("timeout") or 90.0,
+            session=self.openai_session,
+            **options,
         )
 
     # TODO: вынести в миксин какой
