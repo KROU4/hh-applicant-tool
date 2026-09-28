@@ -543,7 +543,9 @@ class Operation(BaseOperation):
         return "\n".join(parts)
 
     def _finalize_letter(self, letter: str) -> str:
-        letter = letter.strip()
+        # hh показывает письмо как обычный текст: markdown остался бы звёздочками
+        letter = re.sub(r"(\*\*|__)(.+?)\1", r"\2", letter)
+        letter = re.sub(r"^#{1,6}\s*", "", letter, flags=re.M).strip()
         # Модель может забыть контакт — он нужен в каждом письме
         if self.letter_contact and self.letter_contact not in letter:
             letter += f"\n\nЖду обратной связи в Telegram: {self.letter_contact}"

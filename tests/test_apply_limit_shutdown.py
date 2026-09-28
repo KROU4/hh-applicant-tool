@@ -230,3 +230,10 @@ class TestDryRun:
         assert out.count("🧪 Тест: откликнулся бы на") == 2
         assert "--- письмо ---" in out and "=== конец ===" in out
         assert not op.tool.api_client.post.called
+
+
+def test_finalize_letter_strips_markdown():
+    op = _make_operation()
+    op.letter_contact = ""
+    text = "## Опыт\n**LLM в проде.** Делал __RAG__.\n* пункт"
+    assert op._finalize_letter(text) == "Опыт\nLLM в проде. Делал RAG.\n* пункт"
