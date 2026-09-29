@@ -468,14 +468,25 @@ def test_running_apply_is_counted_live(bot):
     assert "Откликов сегодня: <b>13</b> из 200" in bot.render("main")[0]
 
 
-def test_daily_schedule_next_run_in_24_to_25_hours(bot):
+def test_daily_schedule_runs_next_morning(bot):
+    from datetime import datetime as _dt, timedelta as _td
+
     bot.state.set("schedule", "apply_enabled", True)
     bot.state.set("schedule", "hours_from", 0)
     bot.state.set("schedule", "hours_to", 0)
-    now = time.time()
+    now = today_ts() + 8 * 3600  # вечер
     bot.tick(now)
-    next_run = bot.state.last_run("apply_next") - now
-    assert 24 * 3600 < next_run <= 25 * 3600
+    run_at = _dt.fromtimestamp(bot.state.last_run("apply_next"))
+    tomorrow = (_dt.fromtimestamp(now) + _td(days=1)).date()
+    assert run_at.date() == tomorrow and run_at.hour == 0
+
+
+def test_daily_schedule_uses_window_start(bot):
+    from datetime import datetime as _dt
+
+    bot.state.set("schedule", "hours_from", 9)
+    run_at = _dt.fromtimestamp(bot.next_apply_time(today_ts(), 24 * 3600))
+    assert run_at.hour == 9 and 1 <= run_at.minute * 60 + run_at.second <= 3600
 
 
 def test_dry_run_is_not_counted(bot):

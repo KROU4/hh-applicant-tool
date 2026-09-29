@@ -11,7 +11,7 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, tzinfo
+from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -1545,6 +1545,21 @@ class HHBot:
             return f"✅ Отправлено в чат hh: «{esc(text[:300])}»"
         return "❌ Не удалось отправить:\n<pre>" + esc((err or out)[-800:]) + "</pre>"
 
+    def next_apply_time(self, now: float, every: int) -> float:
+        """Раз в сутки — завтра в начале окна со сдвигом до часа.
+
+        Интервал 24 ч от старта «сползал» к вечеру, и прогон начинался перед
+        самым концом окна. Чаще раза в сутки — через интервал.
+        """
+        if every < 86400:
+            return now + every + random.randint(60, 600)
+        start_hour = self.state.get("schedule", "hours_from")
+        tomorrow = datetime.fromtimestamp(now, self.tz) + timedelta(days=1)
+        run_at = tomorrow.replace(
+            hour=start_hour, minute=0, second=0, microsecond=0
+        )
+        return run_at.timestamp() + random.randint(60, 3600)
+
     def tick(self, now: float | None = None) -> None:
         now = now or time.time()
         try:
@@ -1571,10 +1586,8 @@ class HHBot:
                 self.state.mark_run("apply_next", now + 3600)
             else:
                 self.start_task("apply", scheduled=True)
-                # Раз в сутки — со случайным сдвигом до часа (24–25 ч),
-                # чтобы запуски не выглядели как по будильнику
-                jitter = random.randint(60, 3600 if every >= 86400 else 600)
-                self.state.mark_run("apply_next", now + every + jitter)
+                self.state.mark_run("apply_next", self.next_apply_time(now, every))
+
 
         if (
             sch["update_resumes_enabled"]
