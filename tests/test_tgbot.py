@@ -712,3 +712,26 @@ def test_captcha_pause_retries_in_an_hour(bot):
     text = bot.api.sent[-1][1]
     assert "пауза — hh попросил капчу" in text and "повторю через 60 мин" in text
     assert "Отправлено откликов: <b>1</b>" in text
+
+
+def test_daily_storage_cleanup(bot):
+    import sqlite3
+
+    con = sqlite3.connect(bot.config_path / "data")
+    con.executescript(
+        "CREATE TABLE vacancies (id INTEGER, updated_at DATETIME);"
+        "CREATE TABLE skipped_vacancies (id INTEGER, created_at DATETIME);"
+        "INSERT INTO vacancies VALUES (1, datetime('now', '-10 days')), (2, datetime('now'));"
+        "INSERT INTO skipped_vacancies VALUES (1, datetime('now', '-40 days')), (2, datetime('now', '-1 day'));"
+    )
+    con.commit()
+    con.close()
+
+    bot.tick()
+    bot.tick()  # второй раз в тот же день ничего не делает
+
+    con = sqlite3.connect(bot.config_path / "data")
+    assert [r[0] for r in con.execute("SELECT id FROM vacancies")] == [2]
+    assert [r[0] for r in con.execute("SELECT id FROM skipped_vacancies")] == [2]
+    con.close()
+    assert bot.state.last_run("cleanup") > 0

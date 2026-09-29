@@ -76,6 +76,10 @@ CAPTCHA_EXIT_CODE = 3
 AUTORESPONDER_RESTART_EVERY = 6 * 3600
 AUTORESPONDER_BACKOFF = 10 * 60
 REFRESH_TOKEN_EVERY = 20 * 3600
+# Ежедневная чистка базы: сохранённые вакансии и отметки о пропуске
+CLEANUP_EVERY = 24 * 3600
+VACANCY_KEEP_DAYS = 7
+SKIPPED_KEEP_DAYS = 30
 SCHEDULER_TICK = 20
 
 SUMMARY_MARKERS = (
@@ -1602,3 +1606,41 @@ class HHBot:
             and token.get("refresh_token")
         ):
             self.start_task("refresh_token", scheduled=True)
+
+        if (
+            now - self.state.last_run("cleanup") > CLEANUP_EVERY
+            and not self.runner.running("apply")
+        ):
+            self.state.mark_run("cleanup", now)
+            try:
+                self.cleanup_storage()
+            except sqlite3.Error as ex:
+                logger.warning("Не удалось почистить базу: %s", ex)
+
+    def cleanup_storage(self) -> None:
+        """Раз в сутки: старые сохранённые вакансии и отметки о пропуске.
+
+        Контакты работодателей не трогаем — они могут пригодиться.
+        """
+        db_path = self.config_path / DATABASE_FILENAME
+        if not db_path.exists():
+            return
+        con = sqlite3.connect(db_path, timeout=30)
+        try:
+            vacancies = con.execute(
+                "DELETE FROM vacancies WHERE updated_at < datetime('now', ?)",
+                (f"-{VACANCY_KEEP_DAYS} days",),
+            ).rowcount
+            skipped = con.execute(
+                "DELETE FROM skipped_vacancies WHERE created_at < datetime('now', ?)",
+                (f"-{SKIPPED_KEEP_DAYS} days",),
+            ).rowcount
+            con.commit()
+            con.execute("VACUUM")
+        finally:
+            con.close()
+        logger.info(
+            "Чистка базы: удалено вакансий %d, отметок о пропуске %d",
+            vacancies,
+            skipped,
+        )
