@@ -69,6 +69,10 @@ NEGOTIATION_STATES = {
 UPDATE_RESUMES_EVERY = 4 * 3600
 # Через сколько повторить оборвавшийся прогон откликов
 APPLY_RETRY_DELAY = 30 * 60
+# После капчи hh ждём дольше
+CAPTCHA_RETRY_DELAY = 60 * 60
+# apply-vacancies завершается с этим кодом, если hh попросил капчу
+CAPTCHA_EXIT_CODE = 3
 AUTORESPONDER_RESTART_EVERY = 6 * 3600
 AUTORESPONDER_BACKOFF = 10 * 60
 REFRESH_TOKEN_EVERY = 20 * 3600
@@ -1342,8 +1346,11 @@ class HHBot:
 
         summary = summarize_log(log)
         auth_problem = code != 0 and any(m in log for m in AUTH_MARKERS)
+        captcha = task.name == "apply" and code == CAPTCHA_EXIT_CODE
         if task.stopped_by_user:
             head = f"⏹ {task.title}: остановлено"
+        elif captcha:
+            head = f"⏸ {task.title}: пауза — hh попросил капчу"
         elif code == 0:
             head = f"✅ {task.title}: готово за {fmt_duration(task.elapsed)}"
         else:
@@ -1364,14 +1371,25 @@ class HHBot:
             and self.state.get("schedule", "apply_enabled")
             and self.apply_quota_left() > 0
         ):
-            # Прогон оборвался — добираем суточную квоту, а не ждём сутки
-            self.state.mark_run("apply_next", time.time() + APPLY_RETRY_DELAY)
+            # Прогон оборвался — добираем суточную квоту, а не ждём сутки.
+            # После капчи ждём дольше: hh снимает её со временем
+            delay = CAPTCHA_RETRY_DELAY if captcha else APPLY_RETRY_DELAY
+            retry_at = time.time() + delay
+            self.state.mark_run("apply_next", retry_at)
+            sch = self.state.get("schedule")
+            if in_hours(
+                datetime.fromtimestamp(retry_at, self.tz).hour,
+                sch["hours_from"],
+                sch["hours_to"],
+            ):
+                when = f"повторю через {delay // 60} мин."
+            else:
+                when = f"продолжу завтра с {sch['hours_from']}:00."
             retry_note = (
-                f"\n\n🔁 Осталось {self.apply_quota_left()} откликов на сегодня — "
-                f"повторю через {APPLY_RETRY_DELAY // 60} мин."
+                f"\n\n🔁 Осталось {self.apply_quota_left()} откликов на сегодня — {when}"
             )
         text = f"<b>{esc(head)}</b>"
-        if task.name == "apply" and code == 0 and not dry_run:
+        if task.name == "apply" and (code == 0 or captcha) and not dry_run:
             text += f"\nОтправлено откликов: <b>{applied}</b>"
         if summary:
             text += f"\n<pre>{esc(summary[-3000:])}</pre>"

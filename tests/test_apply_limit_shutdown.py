@@ -29,6 +29,7 @@ def _make_vacancy(i: int) -> dict:
 
 def _make_operation(max_responses: int = 5) -> Operation:
     op = Operation()
+    op.vacancy_fetch_delay = (0.0, 0.0)
     # Namespace-like args used by _apply_resume.
     # NOTE: `args` is a read-only property backed by `_args` (set in run()).
     op._args = SimpleNamespace(
@@ -263,3 +264,49 @@ class TestExcludedAndNetworkErrors:
         # 1 и 4 — отклик; 2 — стоп-слово из API; 3 — сетевая ошибка, но прогон жив
         assert op.tool.api_client.post.call_count == 2
         assert not op.tool.session.get.called
+
+
+class TestCaptchaPause:
+    def test_captcha_pauses_run_without_marking_vacancies_skipped(self, capsys):
+        from hh_applicant_tool.api.errors import CaptchaRequired
+
+        op = _make_operation(max_responses=0)
+        op.included_filter = r"llm"
+
+        def api_get(url, *a, **k):
+            if url == "/vacancies/2":
+                raise CaptchaRequired(MagicMock(), {"errors": [{"value": "captcha_required", "captcha_url": "https://hh.ru/account/captcha"}]})
+            return {"description": "LLM"}
+
+        op.tool.api_client.get.side_effect = api_get
+        op._get_vacancies = lambda resume_id=None: iter(_make_vacancy(i) for i in range(1, 6))
+        resume = {"id": "r1", "title": "Dev", "alternate_url": "u"}
+        user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+        op._apply_resume(resume=resume, user=user, seen_employers=set())
+
+        assert op.captcha_paused
+        assert op.tool.api_client.post.call_count == 1  # только вакансия 1
+        assert not op.tool.storage.skipped_vacancies.save.called
+        assert "hh запросил капчу" in capsys.readouterr().out
+
+    def test_vacancy_is_fetched_once_per_run(self):
+        op = _make_operation(max_responses=0)
+        op.included_filter = r"llm"
+        op.excluded_filter = r"php"
+        op.tool.api_client.get.return_value = {"description": "LLM"}
+        assert op._is_included(_make_vacancy(7))
+        assert not op._is_excluded(_make_vacancy(7))
+        urls = [c.args[0] for c in op.tool.api_client.get.call_args_list]
+        assert urls.count("/vacancies/7") == 1
+
+
+def test_vacancy_is_dropped_from_cache_after_processing():
+    op = _make_operation(max_responses=0)
+    op.included_filter = r"llm"
+    op.tool.api_client.get.return_value = {"description": "LLM"}
+    op._get_vacancies = lambda resume_id=None: iter(_make_vacancy(i) for i in range(1, 4))
+    resume = {"id": "r1", "title": "Dev", "alternate_url": "u"}
+    user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+    op._apply_resume(resume=resume, user=user, seen_employers=set())
+    assert op.tool.api_client.post.call_count == 3
+    assert op.__dict__.get("_vacancy_cache", {}) == {}

@@ -613,6 +613,8 @@ def test_crashed_apply_run_counts_sent_responses(bot):
 
 def test_failed_apply_run_is_retried_while_quota_left(bot):
     bot.state.set("schedule", "apply_enabled", True)
+    bot.state.set("schedule", "hours_from", 0)
+    bot.state.set("schedule", "hours_to", 0)
     bot.state.set("runs", "applied_log", [[today_ts(), 44]])
     (bot.runner.logs_dir / "apply.log").write_text("[E] 403 Client Error\n", encoding="utf-8")
     task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies"])
@@ -691,3 +693,22 @@ def test_run_crossing_midnight_counts_for_start_day(bot):
     task.started_at = today_ts() - 24 * 3600  # вчерашний старт
     bot._on_task_finish(task, 0)
     assert bot.applied_today() == 0
+
+
+def test_captcha_pause_retries_in_an_hour(bot):
+    bot.state.set("schedule", "apply_enabled", True)
+    bot.state.set("schedule", "hours_from", 0)
+    bot.state.set("schedule", "hours_to", 0)
+    (bot.runner.logs_dir / "apply.log").write_text(
+        "📨 Отправили отклик на вакансию https://hh.ru/vacancy/1\n"
+        "⏸ hh запросил капчу — ставлю отклики на паузу, продолжу позже\n",
+        encoding="utf-8",
+    )
+    task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies"])
+    task.proc.alive = False
+    before = time.time()
+    bot._on_task_finish(task, 3)
+    assert bot.state.last_run("apply_next") == pytest.approx(before + 3600, abs=5)
+    text = bot.api.sent[-1][1]
+    assert "пауза — hh попросил капчу" in text and "повторю через 60 мин" in text
+    assert "Отправлено откликов: <b>1</b>" in text

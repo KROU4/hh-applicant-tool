@@ -43,6 +43,14 @@ logger = logging.getLogger(__package__)
 
 # Конец блока тестового отклика в выводе --dry-run (его разбирает Telegram-бот)
 DRY_RUN_END = "=== конец ==="
+# Код выхода, если hh попросил капчу: бот повторит прогон позже
+CAPTCHA_EXIT_CODE = 3
+# Сколько полных вакансий держать в памяти (сервер маленький)
+VACANCY_CACHE_SIZE = 50
+
+
+class VacancyCaptcha(Exception):
+    """hh требует капчу на просмотр вакансий — прогон нужно поставить на паузу."""
 
 DEFAULT_COVER_LETTER_SYSTEM_PROMPT = (
     "Ты пишешь сопроводительные письма на hh.ru от первого лица за кандидата. "
@@ -120,6 +128,9 @@ class Operation(BaseOperation):
 
     # Сколько откликов отправлено за запуск по всем резюме
     total_applied: int = 0
+    # Пауза между запросами полных вакансий (сек): реже капча hh
+    vacancy_fetch_delay: tuple[float, float] = (1.0, 2.0)
+    captcha_paused: bool = False
     # Контакт в конце AI-письма (например, ссылка на Telegram)
     letter_contact: str = ""
     # Регулярка ключевых слов: без совпадения вакансия пропускается
@@ -418,7 +429,7 @@ class Operation(BaseOperation):
         self.vacancy_filter_ai = None
         self._resume_analysis_cache: dict[tuple[str | None, str], str] = {}
 
-        self._apply_vacancies()
+        return self._apply_vacancies()
 
     def _get_full_resume(self, resume_id: str) -> dict:
         return self.api_client.get(f"/resumes/{resume_id}")
@@ -509,7 +520,7 @@ class Operation(BaseOperation):
         full_vacancy: dict = {}
         if vacancy.get("id"):
             try:
-                full_vacancy = self.api_client.get(f"/vacancies/{vacancy['id']}")
+                full_vacancy = self._full_vacancy(vacancy["id"])
             except ApiError as ex:
                 logger.warning("Не удалось получить вакансию: %s", ex)
         description = strip_tags(
@@ -575,7 +586,7 @@ class Operation(BaseOperation):
 
     def _get_vacancy_key_skills(self, vacancy_id: str | int) -> str:
         try:
-            full_vacancy = self.api_client.get(f"/vacancies/{vacancy_id}")
+            full_vacancy = self._full_vacancy(vacancy_id)
             key_skills_data = full_vacancy.get("key_skills") or []
             return ", ".join(
                 s["name"] for s in key_skills_data if s.get("name")
@@ -703,7 +714,7 @@ class Operation(BaseOperation):
     ) -> bool:
         full_vacancy = None
         if vacancy.get("id"):
-            full_vacancy = self.api_client.get(f"/vacancies/{vacancy['id']}")
+            full_vacancy = self._full_vacancy(vacancy["id"])
 
         vacancy_info = self._build_vacancy_context(
             vacancy,
@@ -828,7 +839,7 @@ class Operation(BaseOperation):
 
         return False
 
-    def _apply_vacancies(self) -> None:
+    def _apply_vacancies(self) -> int | None:
         resumes: list[datatypes.Resume] = self.tool.get_resumes()
         try:
             self.tool.storage.resumes.save_batch(resumes)
@@ -864,6 +875,8 @@ class Operation(BaseOperation):
                 break
             if self.max_responses and self.total_applied >= self.max_responses:
                 break
+            if self.captcha_paused:
+                break
 
         # Синхронизация откликов
         # for neg in self.tool.get_negotiations():
@@ -873,6 +886,9 @@ class Operation(BaseOperation):
         #         logger.warning(e)
 
         print("📝 Отклики на вакансии разосланы!")
+        if self.captcha_paused:
+            return CAPTCHA_EXIT_CODE
+        return None
 
     def _apply_resume(
         self,
@@ -950,6 +966,8 @@ class Operation(BaseOperation):
                 self.vacancy_filter_ai.rate_limit = self.args.ai_rate_limit
 
         for vacancy in self._get_vacancies(resume_id=resume["id"]):
+            # С предыдущей вакансией закончили — её данные больше не нужны
+            self._forget_vacancies()
             if (
                 getattr(self, "_cancel_event", None)
                 and self._cancel_event.is_set()
@@ -1346,6 +1364,14 @@ class Operation(BaseOperation):
                             )
                         except Exception as ex:
                             logger.error(f"Ошибка отправки письма: {ex}")
+            except VacancyCaptcha as ex:
+                logger.warning("hh запросил капчу на просмотр вакансий: %s", ex)
+                print(
+                    "⏸ hh запросил капчу — ставлю отклики на паузу, "
+                    "продолжу позже"
+                )
+                self.captcha_paused = True
+                break
             except LimitExceeded:
                 do_apply = False
                 limit_reached = True
@@ -1366,6 +1392,8 @@ class Operation(BaseOperation):
                     vacancy.get("alternate_url"),
                     ex,
                 )
+
+        self._forget_vacancies()
 
         logger.info(
             "Закончили рассылку откликов для резюме: %s (%s). Отправлено: %d",
@@ -1701,22 +1729,45 @@ class Operation(BaseOperation):
             )
         )
 
-    def _vacancy_description(self, vacancy: SearchVacancy) -> str:
-        """Полный текст вакансии; кэш, чтобы оба фильтра не грузили его дважды."""
-        vacancy_id = str(vacancy["id"])
-        cache = self.__dict__.setdefault("_description_cache", {})
-        if vacancy_id not in cache:
-            try:
-                full = self.api_client.get(f"/vacancies/{vacancy_id}")
-                cache[vacancy_id] = strip_tags(
-                    full.get("description") or ""
-                ) + " " + " ".join(
-                    s.get("name", "") for s in full.get("key_skills") or []
-                )
-            except ApiError as ex:
-                logger.warning("Не удалось получить вакансию %s: %s", vacancy_id, ex)
-                cache[vacancy_id] = ""
-        return cache[vacancy_id]
+    def _forget_vacancies(self) -> None:
+        """Кэш живёт только пока идёт работа над одной вакансией."""
+        self.__dict__.pop("_vacancy_cache", None)
+
+    def _full_vacancy(self, vacancy_id: str | int) -> dict:
+        """Вакансия целиком, не больше одного запроса на вакансию за прогон.
+
+        hh включает капчу, если открывать вакансии слишком часто, поэтому
+        между запросами — пауза, а капча останавливает прогон (VacancyCaptcha),
+        а не превращается в «пустую» вакансию.
+        """
+        vacancy_id = str(vacancy_id)
+        cache = self.__dict__.setdefault("_vacancy_cache", {})
+        if vacancy_id in cache:
+            return cache[vacancy_id]
+        low, high = self.vacancy_fetch_delay
+        if high > 0:
+            time.sleep(random.uniform(low, high))
+        try:
+            full = self.api_client.get(f"/vacancies/{vacancy_id}")
+        except CaptchaRequired as ex:
+            raise VacancyCaptcha(str(ex)) from ex
+        if len(cache) >= VACANCY_CACHE_SIZE:
+            cache.pop(next(iter(cache)))
+        cache[vacancy_id] = full
+        return full
+
+    def _vacancy_description(self, vacancy: SearchVacancy) -> str | None:
+        """Описание и ключевые навыки; None — вакансию получить не удалось."""
+        try:
+            full = self._full_vacancy(vacancy["id"])
+        except ApiError as ex:
+            logger.warning("Не удалось получить вакансию %s: %s", vacancy["id"], ex)
+            return None
+        return (
+            strip_tags(full.get("description") or "")
+            + " "
+            + " ".join(s.get("name", "") for s in full.get("key_skills") or [])
+        )
 
     def _is_included(self, vacancy: SearchVacancy) -> bool:
         if not self.included_filter:
@@ -1724,7 +1775,9 @@ class Operation(BaseOperation):
         pattern = re.compile(self.included_filter, re.IGNORECASE)
         if pattern.search(self._vacancy_summary(vacancy)):
             return True
-        return bool(pattern.search(self._vacancy_description(vacancy)))
+        description = self._vacancy_description(vacancy)
+        # Не смогли проверить — не отбрасываем: поиск hh уже нашёл её по словам
+        return description is None or bool(pattern.search(description))
 
     def _is_excluded(self, vacancy: SearchVacancy) -> bool:
         if not self.excluded_filter:
@@ -1754,6 +1807,8 @@ class Operation(BaseOperation):
         # Полный текст — только если сниппет не сработал. Берём из API:
         # страница hh.ru/vacancy/… с сервера часто отвечает 403 (антибот)
         description = self._vacancy_description(vacancy)
+        if description is None:
+            return False
         logger.debug(description[:2047])
         return bool(excluded_pat.search(description))
 
