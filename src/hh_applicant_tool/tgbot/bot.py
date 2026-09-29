@@ -55,7 +55,8 @@ EXPERIENCE_TITLES = {
 }
 APPLY_INTERVALS = [24, 12, 8, 6, 4]
 # Скользящее окно суточной квоты откликов
-QUOTA_WINDOW = 24 * 3600
+# Сколько хранить журнал отправленных откликов
+APPLIED_LOG_KEEP = 3 * 24 * 3600
 NEGOTIATION_STATES = {
     "response": "📨 отправлено",
     "invitation": "🎉 приглашения",
@@ -140,7 +141,7 @@ INPUT_PROMPTS = {
     "Случайный вариант: {Здравствуйте|Добрый день}.",
     "letter_contact": "📨 Пришлите контакт, который бот добавит в конец каждого AI-письма (например, <code>https://t.me/username</code>). «-» — не добавлять.",
     "hours": "🕘 Пришлите часы работы автооткликов в формате <code>9-21</code>.",
-    "daily_limit": "🎯 Сколько откликов максимум за 24 часа (включая ручные запуски)? У hh.ru потолок 200. «-» — без лимита.",
+    "daily_limit": "🎯 Сколько откликов максимум в сутки (с 00:00, включая ручные запуски)? У hh.ru потолок 200. «-» — без лимита.",
     "openrouter_key": "🔑 Пришлите ключ OpenRouter (sk-or-...).",
 }
 
@@ -581,7 +582,7 @@ class HHBot:
         cfg = self.tool_config()
         token = (cfg.get("token") or {}).get("access_token")
         running = [self._task_line(t.name) for t in self.runner.running_tasks()]
-        applied = self.applied_24h()
+        applied = self.applied_today()
 
         lines = [
             "<b>🤖 HH панель управления</b>",
@@ -596,7 +597,7 @@ class HHBot:
             f"{on_off(sch['update_resumes_enabled'])} подъём резюме каждые 4ч",
             f"{on_off(sch['autoresponder_enabled'])} автоответчик в чатах",
             "",
-            f"Откликов за 24 часа: <b>{applied}</b>"
+            f"Откликов сегодня: <b>{applied}</b>"
             + (f" из {sch['daily_limit']}" if sch.get("daily_limit") else ""),
         ]
         if self.state.get("apply", "dry_run"):
@@ -760,8 +761,8 @@ class HHBot:
             )
             + f", запуск с {sch['hours_from']}:00 до {sch['hours_to']}:00",
             f"   следующий запуск: {when(next_apply) if sch['apply_enabled'] else '—'}",
-            f"🎯 Не больше {sch['daily_limit'] or '∞'} откликов за 24 часа "
-            f"(отправлено: {self.applied_24h()}, осталось: "
+            f"🎯 Не больше {sch['daily_limit'] or '∞'} откликов в сутки "
+            f"(сегодня: {self.applied_today()}, осталось: "
             f"{self.apply_quota_left() if sch['daily_limit'] else '∞'})",
             f"{on_off(sch['update_resumes_enabled'])} Подъём резюме каждые 4ч",
             f"   следующий запуск: {when(next_update) if sch['update_resumes_enabled'] else '—'}",
@@ -804,7 +805,7 @@ class HHBot:
 
     def screen_stats(self) -> tuple[str, dict]:
         lines = ["<b>📊 Статистика</b>", ""]
-        lines.append(f"Откликов за 24 часа (по логам бота): <b>{self.applied_24h()}</b>")
+        lines.append(f"Откликов сегодня (по логам бота): <b>{self.applied_today()}</b>")
         db_path = self.config_path / DATABASE_FILENAME
         if db_path.exists():
             try:
@@ -1163,7 +1164,7 @@ class HHBot:
             if not text.isdigit() or int(text) <= 0:
                 return "❌ Нужно положительное число"
             self.state.set("schedule", key, int(text))
-            return f"✅ Не больше {text} откликов за 24 часа"
+            return f"✅ Не больше {text} откликов в сутки"
         if key == "hours":
             match = re.fullmatch(r"\s*(\d{1,2})\s*[-–]\s*(\d{1,2})\s*", text)
             if not match or int(match[1]) > 23 or int(match[2]) > 24:
@@ -1283,7 +1284,7 @@ class HHBot:
         limit = int(self.state.get("schedule", "daily_limit") or 0)
         if limit <= 0:
             return 10**9
-        return max(limit - self.applied_24h(now), 0)
+        return max(limit - self.applied_today(now), 0)
 
     def start_task(self, name: str, *, scheduled: bool = False) -> str:
         args = self.task_args(name)
@@ -1326,7 +1327,7 @@ class HHBot:
                 sum(int(n) for n in APPLIED_RE.findall(log)),
             )
             if "--dry-run" not in task.args:
-                self._record_applied(applied)
+                self._record_applied(applied, getattr(task, "started_at", None))
         if task.name == "autoresponder":
             if task.elapsed < 120 and not task.stopped_by_user:
                 self.state.mark_run(
@@ -1400,18 +1401,44 @@ class HHBot:
 
     def _applied_log(self, now: float) -> list[list[float]]:
         log = self.state.get("runs").get("applied_log") or []
-        return [r for r in log if r[0] > now - QUOTA_WINDOW]
+        return [r for r in log if r[0] > now - APPLIED_LOG_KEEP]
 
-    def applied_24h(self, now: float | None = None) -> int:
+    def _local_date(self, ts: float) -> Any:
+        return datetime.fromtimestamp(ts, self.tz).date()
+
+    def _running_apply_sent(self) -> int:
+        """Отклики идущего прогона: в журнал они попадут только по его завершении."""
+        task = self.runner.get("apply")
+        if (
+            task is None
+            or getattr(task, "done", False)
+            or task.proc.poll() is not None
+            or "--dry-run" in task.args
+        ):
+            return 0
+        return len(SENT_RE.findall(self.runner.tail("apply", 100_000)))
+
+    def applied_today(self, now: float | None = None) -> int:
+        """Отклики за текущие календарные сутки (как считает лимит hh)."""
         now = now or time.time()
-        return int(sum(count for _, count in self._applied_log(now)))
+        today = self._local_date(now)
+        done = sum(
+            count
+            for ts, count in self._applied_log(now)
+            if self._local_date(ts) == today
+        )
+        return int(done) + self._running_apply_sent()
 
-    def _record_applied(self, count: int) -> None:
+    def _record_applied(self, count: int, when: float | None = None) -> None:
+        """when — старт прогона: вечерний прогон, закончившийся после
+        полуночи, не должен съедать квоту следующего дня."""
         if not count:
             return
         now = time.time()
         self.state.set(
-            "runs", "applied_log", self._applied_log(now) + [[now, count]]
+            "runs",
+            "applied_log",
+            self._applied_log(now) + [[when or now, count]],
         )
 
     # ------------------------------------------------------------- scheduler
