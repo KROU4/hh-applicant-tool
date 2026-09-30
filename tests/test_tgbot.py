@@ -792,3 +792,19 @@ def test_sent_times_are_pruned_by_daily_cleanup(bot):
     write_sent(bot, [now - 50 * 3600, now - 60])
     bot.cleanup_storage()
     assert bot.sent_times_path.read_text(encoding="utf-8").split() == [f"{now - 60:.0f}"]
+
+
+def test_run_that_used_its_share_continues_when_slots_free(bot):
+    now = time.time()
+    write_sent(bot, [now - 23.9 * 3600] * 50 + [now - 60] * 150)
+    bot.state.set("schedule", "apply_enabled", True)
+    (bot.runner.logs_dir / "apply.log").write_text(
+        "📨 Отправили отклик на вакансию https://hh.ru/vacancy/1\n" * 20, encoding="utf-8"
+    )
+    task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies", "--max-responses", "20"])
+    task.proc.alive = False
+    bot._on_task_finish(task, 0)
+    resume_at = bot.state.last_run("apply_next")
+    # старые 50 выйдут из окна через ~6 минут, но не раньше 10-минутной паузы
+    assert now + 600 - 5 <= resume_at <= now + 700
+    assert "Продолжу" in bot.api.sent[-1][1]

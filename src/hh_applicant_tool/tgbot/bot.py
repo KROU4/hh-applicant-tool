@@ -62,6 +62,8 @@ QUOTA_WINDOW = 24 * 3600
 SENT_TIMES_FILENAME = "sent_times.txt"
 # После исчерпания лимита ждём, пока освободится хотя бы столько мест
 MIN_FREE_SLOTS = 20
+# Пауза перед добором лимита после прогона, выбравшего свою порцию
+CAP_RETRY_DELAY = 10 * 60
 # hh сказал «лимит исчерпан», а наш подсчёт расходится — не чаще раза в час
 HH_LIMIT_RETRY = 3600
 NEGOTIATION_STATES = {
@@ -220,6 +222,14 @@ def _split_alternatives(pattern: str) -> list[str]:
             current += ch
     parts.append(current)
     return parts
+
+
+def _option_value(args: list[str], option: str) -> int | None:
+    """Числовое значение опции из списка аргументов (--opt N)."""
+    try:
+        return int(args[args.index(option) + 1])
+    except (ValueError, IndexError):
+        return None
 
 
 def normalize_keywords(pattern: str) -> str:
@@ -1409,14 +1419,25 @@ class HHBot:
         if dry_run and not task.stopped_by_user:
             self._send_dry_run_report(log)
         limit_note = ""
+        # Прогон упёрся в выданную ему порцию лимита, а вакансии ещё есть:
+        # за время прогона освобождаются новые места — добираем их
+        cap = _option_value(task.args, "--max-responses")
+        cap_reached = cap is not None and applied >= cap
         if (
             task.name == "apply"
             and not dry_run
             and not captcha
-            and (HH_LIMIT_MARKER in log or self.apply_quota_left() == 0)
+            and not task.stopped_by_user
+            and (
+                HH_LIMIT_MARKER in log
+                or self.apply_quota_left() == 0
+                or cap_reached
+            )
         ):
             # Лимит 200 за 24 часа занят: продолжаем, когда освободятся места
-            resume_at = self.quota_free_at(MIN_FREE_SLOTS)
+            resume_at = max(
+                self.quota_free_at(MIN_FREE_SLOTS), time.time() + CAP_RETRY_DELAY
+            )
             if HH_LIMIT_MARKER in log:
                 resume_at = max(resume_at, time.time() + HH_LIMIT_RETRY)
             self.state.mark_run("apply_next", resume_at)
