@@ -319,3 +319,14 @@ def test_title_search_checks_keywords_without_opening_vacancy():
     assert op._is_included({**_make_vacancy(1), "name": "LLM Engineer"})
     assert not op._is_included({**_make_vacancy(2), "name": "Менеджер по продажам"})
     assert not op.tool.api_client.get.called
+
+
+
+def test_sent_responses_are_timestamped(tmp_path):
+    op = _make_operation(max_responses=3)
+    op.tool.config_path = tmp_path
+    op._get_vacancies = lambda resume_id=None: iter(_make_vacancy(i) for i in range(10))
+    resume = {"id": "r1", "title": "Dev", "alternate_url": "u"}
+    user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+    op._apply_resume(resume=resume, user=user, seen_employers=set())
+    assert len((tmp_path / "sent_times.txt").read_text().split()) == 3

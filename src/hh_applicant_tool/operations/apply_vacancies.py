@@ -49,6 +49,8 @@ CAPTCHA_EXIT_CODE = 3
 VACANCY_CACHE_SIZE = 50
 
 
+# Время каждого отправленного отклика (для лимита hh за 24 часа)
+SENT_TIMES_FILENAME = "sent_times.txt"
 # Лимит письма в форме отклика с тестом (hh отвечает too-long-letter)
 TEST_LETTER_LIMIT = 1500
 
@@ -1209,6 +1211,7 @@ class Operation(BaseOperation):
                             test_handled = True
                             if result.get("success") == "true":
                                 applied_count += 1
+                                self._record_sent()
                                 print(
                                     "📨 Отправили отклик на вакансию с тестом",
                                     vacancy["alternate_url"],
@@ -1271,6 +1274,7 @@ class Operation(BaseOperation):
                             )
                             assert res == {}
                             applied_count += 1
+                            self._record_sent()
                             print(
                                 "📨 Отправили отклик на вакансию",
                                 vacancy["alternate_url"],
@@ -1691,6 +1695,14 @@ class Operation(BaseOperation):
                 ],
             )
         )
+
+    def _record_sent(self) -> None:
+        """Время отклика: hh считает лимит 200 за скользящие 24 часа."""
+        try:
+            with (self.tool.config_path / SENT_TIMES_FILENAME).open("a") as fp:
+                fp.write(f"{time.time():.0f}\n")
+        except (OSError, TypeError, AttributeError) as ex:
+            logger.debug("Не удалось записать время отклика: %s", ex)
 
     def _prepare_captcha(self, captcha_url: str | None) -> None:
         """Картинка капчи для владельца: её пришлёт Telegram-бот."""
