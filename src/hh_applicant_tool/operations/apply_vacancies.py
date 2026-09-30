@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import html
 import logging
 import random
@@ -23,6 +22,7 @@ from ..api.datatypes import PaginatedItems, SearchVacancy
 from ..api.errors import ApiError, CaptchaRequired, LimitExceeded
 from ..main import BaseNamespace, BaseOperation
 from ..storage.repositories.errors import RepositoryError
+from ..utils import hhcaptcha
 from ..utils.datatypes import VacancyTestsData
 from ..utils.find import find_key
 from ..utils.json import JSONDecoder
@@ -50,7 +50,11 @@ VACANCY_CACHE_SIZE = 50
 
 
 class VacancyCaptcha(Exception):
-    """hh требует капчу на просмотр вакансий — прогон нужно поставить на паузу."""
+    """hh требует капчу — прогон нужно поставить на паузу."""
+
+    def __init__(self, captcha_url: str | None) -> None:
+        super().__init__(f"Captcha required: {captcha_url}")
+        self.captcha_url = captcha_url
 
 DEFAULT_COVER_LETTER_SYSTEM_PROMPT = (
     "Ты пишешь сопроводительные письма на hh.ru от первого лица за кандидата. "
@@ -786,59 +790,6 @@ class Operation(BaseOperation):
 {resume_analysis}
 """
 
-    SEL_CAPTCHA_IMAGE = 'img[data-qa="account-captcha-picture"]'
-    SEL_CAPTCHA_INPUT = 'input[data-qa="account-captcha-input"]'
-
-    # Даже куки не грузятся, исправь
-    async def _solve_captcha_async(self, captcha_url: str) -> bool:
-        from playwright.async_api import async_playwright
-
-        captcha_ai = self.tool.get_captcha_ai()
-
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
-            try:
-                context = await browser.new_context()
-                page = await context.new_page()
-
-                await page.goto(captcha_url, timeout=30000)
-
-                captcha_element = await page.wait_for_selector(
-                    self.SEL_CAPTCHA_IMAGE, timeout=10000, state="visible"
-                )
-
-                img_bytes = await captcha_element.screenshot()
-
-                captcha_text = await asyncio.to_thread(
-                    captcha_ai.solve_captcha, img_bytes
-                )
-
-                if not captcha_text:
-                    logger.error("AI не смог распознать капчу")
-                    return False
-
-                logger.info(f"Распознанный текст капчи: {captcha_text}")
-
-                await page.fill(self.SEL_CAPTCHA_INPUT, captcha_text)
-                await page.press(self.SEL_CAPTCHA_INPUT, "Enter")
-
-                await page.wait_for_load_state("networkidle", timeout=15000)
-
-                cookies = await context.cookies()
-                for c in cookies:
-                    self.tool.session.cookies.set(
-                        c["name"],
-                        c["value"],
-                        domain=c.get("domain", ""),
-                        path=c.get("path", "/"),
-                    )
-
-                return True
-            finally:
-                await browser.close()
-
-        return False
-
     def _apply_vacancies(self) -> int | None:
         resumes: list[datatypes.Resume] = self.tool.get_resumes()
         try:
@@ -1298,30 +1249,9 @@ class Operation(BaseOperation):
                         )
                         continue
                     except CaptchaRequired as ex:
-                        logger.warning(f"Требуется капча: {ex.captcha_url}")
-                        try:
-                            success = asyncio.run(
-                                self._solve_captcha_async(ex.captcha_url)
-                            )
-                            if success:
-                                if not self.dry_run:
-                                    res = self.api_client.post(
-                                        "/negotiations",
-                                        params,
-                                        delay=random.uniform(1, 3),
-                                    )
-                                    assert res == {}
-                                    applied_count += 1
-                                    print(
-                                        "📨 Отправили отклик на вакансию после капчи",
-                                        vacancy["alternate_url"],
-                                    )
-                            else:
-                                logger.error("Не удалось решить капчу")
-                                raise
-                        except Exception as e:
-                            logger.error(f"Ошибка при решении капчи: {e}")
-                            raise
+                        # Капчу вводит владелец в Telegram-боте; вакансия
+                        # вернётся в работу при продолжении прогона
+                        raise VacancyCaptcha(ex.captcha_url) from ex
 
                 # Отправка письма на email
                 if self.args.send_email:
@@ -1365,10 +1295,11 @@ class Operation(BaseOperation):
                         except Exception as ex:
                             logger.error(f"Ошибка отправки письма: {ex}")
             except VacancyCaptcha as ex:
-                logger.warning("hh запросил капчу на просмотр вакансий: %s", ex)
+                logger.warning("hh запросил капчу: %s", ex)
+                self._prepare_captcha(ex.captcha_url)
                 print(
                     "⏸ hh запросил капчу — ставлю отклики на паузу, "
-                    "продолжу позже"
+                    "продолжу после ввода капчи"
                 )
                 self.captcha_paused = True
                 break
@@ -1729,6 +1660,15 @@ class Operation(BaseOperation):
             )
         )
 
+    def _prepare_captcha(self, captcha_url: str | None) -> None:
+        """Картинка капчи для владельца: её пришлёт Telegram-бот."""
+        if not captcha_url:
+            return
+        try:
+            hhcaptcha.prepare(self.tool, captcha_url)
+        except Exception as ex:
+            logger.warning("Не удалось подготовить картинку капчи: %s", ex)
+
     def _forget_vacancies(self) -> None:
         """Кэш живёт только пока идёт работа над одной вакансией."""
         self.__dict__.pop("_vacancy_cache", None)
@@ -1750,7 +1690,7 @@ class Operation(BaseOperation):
         try:
             full = self.api_client.get(f"/vacancies/{vacancy_id}")
         except CaptchaRequired as ex:
-            raise VacancyCaptcha(str(ex)) from ex
+            raise VacancyCaptcha(ex.captcha_url) from ex
         if len(cache) >= VACANCY_CACHE_SIZE:
             cache.pop(next(iter(cache)))
         cache[vacancy_id] = full

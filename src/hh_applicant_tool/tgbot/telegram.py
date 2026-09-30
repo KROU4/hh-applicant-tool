@@ -183,10 +183,19 @@ class TelegramAPI:
             )
 
     def send_photo(
-        self, chat_id: int, photo: Path | str, caption: str | None = None
+        self,
+        chat_id: int,
+        photo: Path | str,
+        caption: str | None = None,
+        reply_markup: dict | None = None,
     ) -> dict:
         """Фото из файла или по file_id (повторно без загрузки)."""
-        params = dict(chat_id=chat_id, caption=caption, parse_mode="HTML")
+        params = dict(
+            chat_id=chat_id,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
         if isinstance(photo, Path):
             with photo.open("rb") as fp:
                 return self.call(

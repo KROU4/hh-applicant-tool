@@ -41,7 +41,7 @@ class FakeAPI:
     def download_file(self, file_id):
         return self.files[file_id]
 
-    def send_photo(self, chat_id, photo, caption=None):
+    def send_photo(self, chat_id, photo, caption=None, reply_markup=None):
         self.photos.append((chat_id, photo, caption))
         return {"photo": [{"file_id": "small"}, {"file_id": "big-id"}]}
 
@@ -746,3 +746,38 @@ def test_daily_storage_cleanup(bot):
     assert [r[0] for r in con.execute("SELECT id FROM skipped_vacancies")] == [2]
     con.close()
     assert bot.state.last_run("cleanup") > 0
+
+
+def test_captcha_is_sent_to_owner_and_answer_resumes_apply(bot):
+    bot.state.set("schedule", "apply_enabled", True)
+    bot.state.set("schedule", "hours_from", 0)
+    bot.state.set("schedule", "hours_to", 0)
+    (bot.config_path / "captcha.png").write_bytes(b"PNG")
+    (bot.config_path / "captcha_pending.json").write_text('{"key": "k"}', encoding="utf-8")
+    (bot.runner.logs_dir / "apply.log").write_text("⏸ hh запросил капчу\n", encoding="utf-8")
+    task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies"])
+    task.proc.alive = False
+
+    bot._on_task_finish(task, 3)
+
+    chat, photo, caption = bot.api.photos[-1]
+    assert chat == OWNER and photo.name == "captcha.png" and "просит капчу" in caption
+    assert "введите капчу — продолжу сразу" in bot.api.sent[-1][1]
+
+    calls = []
+    bot.runner.run_sync = lambda args, timeout=90: calls.append(args) or (0, "ok", "")
+    bot._background = lambda fn: fn()
+    bot.handle_update(message("хатку кропил"))
+    assert calls[-1] == ["captcha", "--answer=хатку кропил"]
+    assert bot.runner.started[-1][0] == "apply"
+    assert "Капча принята" in bot.api.sent[-1][1]
+
+
+def test_wrong_captcha_answer_sends_new_image(bot):
+    (bot.config_path / "captcha.png").write_bytes(b"PNG")
+    (bot.config_path / "captcha_pending.json").write_text('{"key": "k"}', encoding="utf-8")
+    bot.runner.run_sync = lambda args, timeout=90: (4, "", "")
+    bot._background = lambda fn: fn()
+    bot.handle_update(message("неверно"))
+    assert "Неверно" in bot.api.photos[-1][2]
+    assert bot.pending_input[OWNER] == "captcha"

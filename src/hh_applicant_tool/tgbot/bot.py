@@ -20,6 +20,7 @@ import requests
 
 from ..constants import CONFIG_FILENAME, DATABASE_FILENAME, LOG_FILENAME
 from ..utils.config import Config
+from ..utils import hhcaptcha
 from ..utils.string import rand_text, render_template
 from .runner import Task, TaskRunner
 from .state import BotState
@@ -73,6 +74,8 @@ APPLY_RETRY_DELAY = 30 * 60
 CAPTCHA_RETRY_DELAY = 60 * 60
 # apply-vacancies завершается с этим кодом, если hh попросил капчу
 CAPTCHA_EXIT_CODE = 3
+# hh-applicant-tool captcha --answer: неверный ответ, новая картинка готова
+CAPTCHA_WRONG_EXIT_CODE = 4
 AUTORESPONDER_RESTART_EVERY = 6 * 3600
 AUTORESPONDER_BACKOFF = 10 * 60
 REFRESH_TOKEN_EVERY = 20 * 3600
@@ -481,6 +484,13 @@ class HHBot:
             return
 
         key = self.pending_input.pop(chat_id, None)
+        if key == "captcha" or (
+            key is None and hhcaptcha.load_pending(self.config_path)
+        ):
+            # Ответ на капчу hh (в т.ч. если бот перезапускался и забыл, что ждал)
+            answer = text.strip()
+            self._background(lambda: self.answer_captcha(chat_id, answer))
+            return
         if key and key.startswith("reply:"):
             # Свой ответ работодателю в чат hh
             hh_chat_id = key.removeprefix("reply:")
@@ -1049,6 +1059,13 @@ class HHBot:
             self.show(chat_id, message_id, "settings")
         elif action == "log":
             self.send_log(chat_id, arg)
+        elif action == "captcha":
+            if arg == "refresh":
+                self.api.answer_callback(query["id"], "Запрашиваю новую…")
+                self._background(lambda: self.refresh_captcha(chat_id))
+                return
+            self.pending_input.pop(chat_id, None)
+            answer = "Хорошо, попробую позже — капча придёт снова"
         elif action == "ans":
             hh_chat_id, _, index = arg.partition(":")
             options = self.state.get("answers").get(hh_chat_id) or []
@@ -1386,7 +1403,12 @@ class HHBot:
                 sch["hours_from"],
                 sch["hours_to"],
             ):
-                when = f"повторю через {delay // 60} мин."
+                when = (
+                    "введите капчу — продолжу сразу, иначе повторю через "
+                    f"{delay // 60} мин."
+                    if captcha
+                    else f"повторю через {delay // 60} мин."
+                )
             else:
                 when = f"продолжу завтра с {sch['hours_from']}:00."
             retry_note = (
@@ -1405,6 +1427,64 @@ class HHBot:
             silent=task.scheduled and code == 0,
             markup=keyboard([button("📜 Полный лог", f"log:{task.name}"), button("🏠 Меню", "screen:main")]),
         )
+        if captcha:
+            self.ask_captcha()
+
+    # ---------------------------------------------------------------- captcha
+
+    def ask_captcha(self, chat_id: int | None = None, caption: str = "") -> bool:
+        """Картинка капчи hh владельцу; ответ он присылает текстом."""
+        owner = chat_id or self.state.owner_id
+        image = hhcaptcha.image_path(self.config_path)
+        if not owner or not image.exists():
+            return False
+        self.pending_input[owner] = "captcha"
+        self.api.send_photo(
+            owner,
+            image,
+            caption
+            or "🔐 <b>hh.ru просит капчу</b>\nПришлите текст с картинки одним сообщением — "
+            "отправлю его в hh и продолжу отклики.",
+            reply_markup=keyboard(
+                [
+                    button("🔄 Другая картинка", "captcha:refresh"),
+                    button("⏭ Позже", "captcha:later"),
+                ]
+            ),
+        )
+        return True
+
+    def answer_captcha(self, chat_id: int, answer: str) -> None:
+        if not answer:
+            self.ask_captcha(chat_id, "Пустой ответ. Пришлите текст с картинки:")
+            return
+        self.api.send_message(chat_id, "⏳ Проверяю…")
+        code, out, err = self.runner.run_sync(["captcha", f"--answer={answer}"])
+        if code == 0:
+            started = self.start_task("apply")
+            self.api.send_message(
+                chat_id,
+                "✅ Капча принята. "
+                + (
+                    "Продолжаю отклики."
+                    if started == "Запущено"
+                    else f"Отклики: {started.lower()}."
+                ),
+            )
+        elif code == CAPTCHA_WRONG_EXIT_CODE:
+            self.ask_captcha(chat_id, "❌ Неверно. Вот новая картинка — пришлите текст с неё:")
+        else:
+            self.api.send_message(
+                chat_id,
+                "⚠️ Не удалось отправить капчу:\n<pre>"
+                + esc(ANSI_RE.sub("", err or out)[-600:])
+                + "</pre>\nПопробую снова при следующем прогоне.",
+            )
+
+    def refresh_captcha(self, chat_id: int) -> None:
+        code, out, err = self.runner.run_sync(["captcha", "--refresh"])
+        if code != 0 or not self.ask_captcha(chat_id, "🔄 Новая картинка — пришлите текст с неё:"):
+            self.api.send_message(chat_id, "Капча уже не ждёт ответа.")
 
     def _send_dry_run_report(self, log: str) -> None:
         """Каждый тестовый отклик — отдельным сообщением: вакансия и письмо."""
