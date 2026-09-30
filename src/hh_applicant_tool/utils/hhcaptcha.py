@@ -131,8 +131,15 @@ def submit(tool: HHApplicantTool, answer: str) -> bool:
         headers=_headers(tool, info["captcha_url"]),
         allow_redirects=False,
     )
-    logger.info("Ответ на капчу: HTTP %s", response.status_code)
-    if response.status_code in (301, 302, 303, 307, 308):
+    location = response.headers.get("Location") or ""
+    logger.info(
+        "Ответ на капчу: HTTP %s, переход на %s", response.status_code, location[:120]
+    )
+    # Неверный ответ тоже может быть редиректом — обратно на страницу капчи
+    accepted = response.status_code in (301, 302, 303, 307, 308) and (
+        "captcha" not in location
+    )
+    if accepted:
         clear(tool.config_path)
         return True
     new_image(tool, info)

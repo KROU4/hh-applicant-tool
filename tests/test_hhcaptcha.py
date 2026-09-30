@@ -10,7 +10,7 @@ from hh_applicant_tool.utils import hhcaptcha
 CAPTCHA_URL = "https://hh.ru/account/captcha?state=abc"
 
 
-def make_tool(tmp_path, *, submit_status=302):
+def make_tool(tmp_path, *, submit_status=302, location="/"):
     session = MagicMock()
     posts = []
 
@@ -21,7 +21,7 @@ def make_tool(tmp_path, *, submit_status=302):
                 raise_for_status=lambda: None,
                 json=lambda: {"key": f"key-{len(posts)}"},
             )
-        return SimpleNamespace(status_code=submit_status)
+        return SimpleNamespace(status_code=submit_status, headers={"Location": location})
 
     session.post.side_effect = post
     session.get.side_effect = lambda url, params=None, headers=None: SimpleNamespace(
@@ -76,3 +76,10 @@ def test_submit_without_pending_captcha(tmp_path):
     tool, _ = make_tool(tmp_path)
     with pytest.raises(hhcaptcha.CaptchaError):
         hhcaptcha.submit(tool, "текст")
+
+
+def test_redirect_back_to_captcha_means_wrong_answer(tmp_path):
+    tool, _ = make_tool(tmp_path, location="/account/captcha?state=abc")
+    hhcaptcha.prepare(tool, CAPTCHA_URL)
+    assert not hhcaptcha.submit(tool, "неверно")
+    assert hhcaptcha.load_pending(tmp_path) is not None

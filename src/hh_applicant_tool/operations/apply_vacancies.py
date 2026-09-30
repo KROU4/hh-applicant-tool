@@ -133,7 +133,7 @@ class Operation(BaseOperation):
     # Сколько откликов отправлено за запуск по всем резюме
     total_applied: int = 0
     # Пауза между запросами полных вакансий (сек): реже капча hh
-    vacancy_fetch_delay: tuple[float, float] = (1.0, 2.0)
+    vacancy_fetch_delay: tuple[float, float] = (3.0, 6.0)
     captcha_paused: bool = False
     # Контакт в конце AI-письма (например, ссылка на Telegram)
     letter_contact: str = ""

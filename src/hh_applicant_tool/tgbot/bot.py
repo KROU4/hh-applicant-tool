@@ -1460,6 +1460,7 @@ class HHBot:
             return
         self.api.send_message(chat_id, "⏳ Проверяю…")
         code, out, err = self.runner.run_sync(["captcha", f"--answer={answer}"])
+        logger.info("Ответ на капчу из Telegram: код %s", code)
         if code == 0:
             started = self.start_task("apply")
             self.api.send_message(
