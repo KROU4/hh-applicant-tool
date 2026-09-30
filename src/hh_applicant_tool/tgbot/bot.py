@@ -215,6 +215,21 @@ def _split_alternatives(pattern: str) -> list[str]:
     return parts
 
 
+def normalize_keywords(pattern: str) -> str:
+    """Слова через «|» понимаются буквально: C++, C#, .NET, Node.js.
+
+    В регулярном выражении «C++» значит «сколько угодно букв C» — такой
+    стоп-фильтр отсекал почти все вакансии. Варианты со скобками, «?», «\\»
+    и т.п. остаются регулярными выражениями как есть.
+    """
+    parts = []
+    for alt in _split_alternatives(pattern.strip()):
+        if re.fullmatch(r"[\w\s+#.-]+", alt) and re.search(r"[+#.]", alt):
+            alt = re.escape(alt.strip()).replace("\\ ", " ").replace("\\-", "-")
+        parts.append(alt)
+    return "|".join(parts)
+
+
 def regex_to_query(pattern: str) -> str:
     """Поисковый запрос hh из регулярки: «llm|rag|ai engineer» →
     «llm OR rag OR "ai engineer"». Части с символами регулярок в запрос не
@@ -254,9 +269,13 @@ def build_apply_args(settings: dict[str, Any], letter_path: Path) -> list[str]:
     if search:
         args.append(f"--search={search}")
     if settings.get("included_filter"):
-        args.append(f"--included-filter={settings['included_filter']}")
+        args.append(
+            f"--included-filter={normalize_keywords(settings['included_filter'])}"
+        )
     if settings.get("excluded_filter"):
-        args.append(f"--excluded-filter={settings['excluded_filter']}")
+        args.append(
+            f"--excluded-filter={normalize_keywords(settings['excluded_filter'])}"
+        )
     if settings.get("max_responses"):
         args += ["--max-responses", str(settings["max_responses"])]
     if settings.get("resume_id"):
@@ -1144,6 +1163,7 @@ class HHBot:
         clear = text in ("-", "—")
         if key in ("search", "excluded_filter", "included_filter", "system_prompt", "letter_contact"):
             if key in ("excluded_filter", "included_filter") and not clear:
+                text = normalize_keywords(text)
                 try:
                     re.compile(text)
                 except re.error as ex:

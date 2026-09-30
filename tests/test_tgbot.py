@@ -781,3 +781,17 @@ def test_wrong_captcha_answer_sends_new_image(bot):
     bot.handle_update(message("неверно"))
     assert "Неверно" in bot.api.photos[-1][2]
     assert bot.pending_input[OWNER] == "captcha"
+
+
+def test_stop_words_are_literal(bot, tmp_path):
+    import re as _re
+
+    from hh_applicant_tool.tgbot.bot import normalize_keywords
+
+    assert normalize_keywords("junior|C++|c#|.net") == r"junior|C\+\+|c\#|\.net"
+    # Регулярные выражения и повторная нормализация не меняются
+    assert normalize_keywords(r"ai[- ]?engineer|C\+\+") == r"ai[- ]?engineer|C\+\+"
+    args = build_apply_args({"excluded_filter": "junior|C++"}, tmp_path / "letter.txt")
+    pattern = [a for a in args if a.startswith("--excluded-filter=")][0].split("=", 1)[1]
+    assert not _re.search(pattern, "LLM-инженер Lexica", _re.I)
+    assert _re.search(pattern, "C++ developer", _re.I)
