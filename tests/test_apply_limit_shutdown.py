@@ -310,3 +310,12 @@ def test_vacancy_is_dropped_from_cache_after_processing():
     op._apply_resume(resume=resume, user=user, seen_employers=set())
     assert op.tool.api_client.post.call_count == 3
     assert op.__dict__.get("_vacancy_cache", {}) == {}
+
+
+def test_title_search_checks_keywords_without_opening_vacancy():
+    op = _make_operation(max_responses=0)
+    op.included_filter = r"llm"
+    op.search_field = ["name"]
+    assert op._is_included({**_make_vacancy(1), "name": "LLM Engineer"})
+    assert not op._is_included({**_make_vacancy(2), "name": "Менеджер по продажам"})
+    assert not op.tool.api_client.get.called

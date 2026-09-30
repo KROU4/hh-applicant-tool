@@ -1715,6 +1715,10 @@ class Operation(BaseOperation):
         pattern = re.compile(self.included_filter, re.IGNORECASE)
         if pattern.search(self._vacancy_summary(vacancy)):
             return True
+        if "name" in (getattr(self, "search_field", None) or []):
+            # Ищем по названию — в описание не лезем: каждый лишний просмотр
+            # вакансии приближает капчу hh
+            return False
         description = self._vacancy_description(vacancy)
         # Не смогли проверить — не отбрасываем: поиск hh уже нашёл её по словам
         return description is None or bool(pattern.search(description))
