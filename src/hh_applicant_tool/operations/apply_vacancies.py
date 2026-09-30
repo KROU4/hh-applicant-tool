@@ -49,6 +49,27 @@ CAPTCHA_EXIT_CODE = 3
 VACANCY_CACHE_SIZE = 50
 
 
+# Лимит письма в форме отклика с тестом (hh отвечает too-long-letter)
+TEST_LETTER_LIMIT = 1500
+
+
+def shorten_letter(letter: str, limit: int) -> str:
+    """Обрезает письмо по границе абзаца или предложения, сохраняя контакт в конце."""
+    if len(letter) <= limit:
+        return letter
+    lines = letter.rstrip().split("\n")
+    tail = lines[-1] if "t.me/" in lines[-1] or "@" in lines[-1] else ""
+    body = "\n".join(lines[:-1]) if tail else letter
+    budget = limit - (len(tail) + 2 if tail else 0)
+    cut = body[:budget]
+    for sep in ("\n\n", ". ", "! ", "? "):
+        pos = cut.rfind(sep)
+        if pos > budget // 2:
+            cut = cut[: pos + 1]
+            break
+    return (cut.rstrip() + ("\n\n" + tail if tail else ""))[:limit]
+
+
 class VacancyCaptcha(Exception):
     """hh требует капчу — прогон нужно поставить на паузу."""
 
@@ -1174,6 +1195,17 @@ class Operation(BaseOperation):
                                 resume_hash=resume["id"],
                                 letter=letter,
                             )
+                            if (
+                                isinstance(result, dict)
+                                and result.get("error") == "too-long-letter"
+                            ):
+                                # В форме с тестом у письма свой, меньший лимит
+                                letter = shorten_letter(letter, TEST_LETTER_LIMIT)
+                                result = self._solve_vacancy_test(
+                                    vacancy_id=vacancy["id"],
+                                    resume_hash=resume["id"],
+                                    letter=letter,
+                                )
                             test_handled = True
                             if result.get("success") == "true":
                                 applied_count += 1
@@ -1744,6 +1776,18 @@ class Operation(BaseOperation):
         excluded_pat: re.Pattern = re.compile(
             self.excluded_filter, re.IGNORECASE
         )
+
+        if "name" in (getattr(self, "search_field", None) or []):
+            # Ищем по названию — и стоп-слова смотрим в названии и компании:
+            # в описаниях «Java», «junior», «Сбер» встречаются мимоходом
+            # («будете менторить junior») и отсекали подходящие вакансии
+            title = " ".join(
+                filter(
+                    None,
+                    [vacancy.get("name"), (vacancy.get("employer") or {}).get("name")],
+                )
+            )
+            return bool(excluded_pat.search(title))
 
         if excluded_pat.search(vacancy_summary):
             return True
