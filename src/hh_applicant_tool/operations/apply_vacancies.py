@@ -143,6 +143,8 @@ class Namespace(BaseNamespace):
     total_pages: int
     excluded_filter: str | None
     included_filter: str | None
+    recommended_first: bool
+    priority_area: list[str] | None
     max_responses: int
     send_email: bool
     skip_tests: bool
@@ -250,6 +252,16 @@ class Operation(BaseOperation):
             "--excluded-filter",
             type=str,
             help=r"Исключить вакансии, если название или описание не соответствует шаблону. Например, `--excluded-filter 'junior|стажир|bitrix|дружн\w+ коллектив|полиграф|open\s*space|опенспейс|хакатон|конкурс|тестов\w+ задан'`",
+        )
+        parser.add_argument(
+            "--recommended-first",
+            action="store_true",
+            help="Сначала откликаться на рекомендованные hh вакансии для резюме, потом на найденные поиском",
+        )
+        parser.add_argument(
+            "--priority-area",
+            nargs="+",
+            help="Регион (area id), вакансии из которого обрабатываются раньше остальных, например 16 — Беларусь",
         )
         parser.add_argument(
             "--included-filter",
@@ -418,6 +430,8 @@ class Operation(BaseOperation):
         self.excluded_employer_id = args.excluded_employer_id
         self.excluded_filter = args.excluded_filter
         self.included_filter = args.included_filter
+        self.recommended_first = bool(args.recommended_first)
+        self.priority_area = args.priority_area
         self.experience = args.experience
         self.force_message = args.force_message
         self.industry = args.industry
@@ -1658,21 +1672,42 @@ class Operation(BaseOperation):
     def _get_vacancies(
         self, resume_id: str | None = None
     ) -> Iterator[SearchVacancy]:
+        similar = f"/resumes/{resume_id}/similar_vacancies"
+        if not self.search:
+            yield from self._paginate(similar, {})
+            return
+
+        # Сначала самое релевантное: рекомендации hh под это резюме, затем
+        # поиск в приоритетном регионе, затем везде. Повторы пропускаем
+        sources: list[tuple[str, dict[str, Any]]] = []
+        if getattr(self, "recommended_first", False) and resume_id:
+            sources.append((similar, {"text": None, "search_field": None}))
+        priority_area = getattr(self, "priority_area", None)
+        if priority_area and not self.area:
+            sources.append(("/vacancies", {"area": list(priority_area)}))
+        sources.append(("/vacancies", {}))
+
+        seen: set[str] = set()
+        for url, overrides in sources:
+            for vacancy in self._paginate(url, overrides):
+                if vacancy["id"] in seen:
+                    continue
+                seen.add(vacancy["id"])
+                yield vacancy
+
+    def _paginate(
+        self, url: str, overrides: dict[str, Any]
+    ) -> Iterator[SearchVacancy]:
         for page in range(self.total_pages):
-            logger.debug(f"Загружаем вакансии со страницы: {page + 1}")
+            logger.debug("Загружаем вакансии: %s, страница %d", url, page + 1)
             params = self._get_search_params(page)
+            for key, value in overrides.items():
+                if value is None:
+                    params.pop(key, None)
+                else:
+                    params[key] = value
 
-            if self.search:
-                res: PaginatedItems[SearchVacancy] = self.api_client.get(
-                    "/vacancies",
-                    params,
-                )
-            else:
-                res: PaginatedItems[SearchVacancy] = self.api_client.get(
-                    f"/resumes/{resume_id}/similar_vacancies",
-                    params,
-                )
-
+            res: PaginatedItems[SearchVacancy] = self.api_client.get(url, params)
             logger.debug(f"Количество вакансий: {res['found']}")
 
             if not res["items"]:

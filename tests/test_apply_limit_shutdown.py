@@ -330,3 +330,34 @@ def test_sent_responses_are_timestamped(tmp_path):
     user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
     op._apply_resume(resume=resume, user=user, seen_employers=set())
     assert len((tmp_path / "sent_times.txt").read_text().split()) == 3
+
+
+def test_vacancy_sources_priority_and_dedup():
+    op = _make_operation(max_responses=0)
+    op.search = "llm"
+    op.search_field = ["name"]
+    op.area = None
+    op.recommended_first = True
+    op.priority_area = ["16"]
+    op.total_pages = 1
+    calls = []
+
+    def api_get(url, params, *a, **k):
+        calls.append((url, params))
+        if "similar_vacancies" in url:
+            items = [{"id": "1"}, {"id": "2"}]
+        elif params.get("area") == ["16"]:
+            items = [{"id": "2"}, {"id": "3"}]
+        else:
+            items = [{"id": "3"}, {"id": "4"}]
+        return {"items": items, "found": len(items), "pages": 1}
+
+    op.tool.api_client.get.side_effect = api_get
+    op._get_search_params = lambda page: {"page": page, "text": "llm", "search_field": ["name"]}
+    ids = [v["id"] for v in op._get_vacancies(resume_id="r1")]
+
+    assert ids == ["1", "2", "3", "4"]
+    assert calls[0][0] == "/resumes/r1/similar_vacancies"
+    assert "text" not in calls[0][1] and "search_field" not in calls[0][1]
+    assert calls[1][1]["area"] == ["16"] and calls[1][1]["text"] == "llm"
+    assert "area" not in calls[2][1]

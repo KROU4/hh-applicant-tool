@@ -25,6 +25,10 @@ DEFAULTS: dict[str, Any] = {
         "included_filter": "",
         # Искать только в названии вакансии (search_field=name)
         "search_in_name": False,
+        # Сначала рекомендации hh под резюме, затем поиск
+        "recommended_first": True,
+        # Регион (area id), вакансии из которого обрабатываются первыми
+        "priority_area": None,
         "max_responses": None,
         "resume_id": None,
         "resume_title": None,

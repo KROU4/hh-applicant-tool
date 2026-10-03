@@ -40,6 +40,9 @@ TASK_TITLES = {
 AI_FILTERS = [None, "light", "heavy"]
 AI_FILTER_TITLES = {None: "выкл", "light": "быстрый", "heavy": "полный"}
 WORK_FORMATS = [None, "REMOTE", "HYBRID", "REMOTE,HYBRID"]
+# Регион, вакансии из которого идут первыми (area id hh)
+PRIORITY_AREAS = [None, "16", "113", "40"]
+PRIORITY_AREA_TITLES = {None: "нет", "16": "Беларусь", "113": "Россия", "40": "Казахстан"}
 WORK_FORMAT_TITLES = {
     None: "любой",
     "REMOTE": "удалёнка",
@@ -307,6 +310,10 @@ def build_apply_args(settings: dict[str, Any], letter_path: Path) -> list[str]:
         args += ["--work-format", *settings["work_format"].split(",")]
     if settings.get("search_in_name"):
         args += ["--search-field", "name"]
+    if settings.get("recommended_first"):
+        args.append("--recommended-first")
+    if settings.get("priority_area"):
+        args += ["--priority-area", str(settings["priority_area"])]
     return args
 
 
@@ -704,6 +711,8 @@ class HHBot:
             f"🔍 Поиск: {esc(s['search']) or '<i>из ключевых слов</i>' if not s['search'] and s.get('included_filter') else esc(s['search']) or '<i>рекомендованные вакансии</i>'}",
             f"🎯 Ключевые слова (regex): {esc(s.get('included_filter') or '—')}",
             f"🔤 Искать: {'только в названии' if s.get('search_in_name') else 'везде (название и описание)'}",
+            f"⭐ Сначала рекомендации hh: {on_off(s.get('recommended_first'))}",
+            f"🗺 Сначала регион: {PRIORITY_AREA_TITLES.get(s.get('priority_area'), s.get('priority_area'))}",
             f"   запрос в hh: <code>{esc(s['search'] or regex_to_query(s.get('included_filter') or '') or '—')}</code>",
             f"🚫 Стоп-слова: {esc(s['excluded_filter']) or '—'}",
             f"📄 Резюме: {esc(s['resume_title'] or 'все опубликованные')}",
@@ -736,6 +745,16 @@ class HHBot:
             [
                 button("📄 Резюме", "screen:resumes"),
                 button("🔢 Лимит", "input:max_responses"),
+            ],
+            [
+                button(
+                    f"⭐ Рекомендации {on_off(s.get('recommended_first'))}",
+                    "flip:recommended_first",
+                ),
+                button(
+                    f"🗺 Регион: {PRIORITY_AREA_TITLES.get(s.get('priority_area'), s.get('priority_area'))}",
+                    "cycle:priority_area",
+                ),
             ],
             [
                 button("🌍 Формат", "cycle:work_format"),
@@ -1062,6 +1081,7 @@ class HHBot:
             options = {
                 "ai_filter": AI_FILTERS,
                 "work_format": WORK_FORMATS,
+                "priority_area": PRIORITY_AREAS,
                 "experience": EXPERIENCES,
             }[arg]
             self.state.set("apply", arg, cycle(options, self.state.get("apply", arg)))

@@ -824,3 +824,14 @@ def test_new_login_resets_quota(bot):
     write_sent(bot, [time.time() - 60] * 10)
     bot.handle_document(OWNER, {"file_id": "f9", "file_name": "config.json"})
     assert bot.applied_24h() == 10
+
+
+def test_priority_settings_go_to_apply_args(bot, tmp_path):
+    from hh_applicant_tool.main import HHApplicantTool
+
+    bot.handle_update(callback("cycle:priority_area"))
+    assert bot.state.get("apply", "priority_area") == "16"
+    args = build_apply_args(bot.state.get("apply"), tmp_path / "letter.txt")
+    ns = HHApplicantTool()._parser.parse_args(args)
+    assert ns.recommended_first and ns.priority_area == ["16"]
+    assert "Беларусь" in bot.render("settings")[0]
