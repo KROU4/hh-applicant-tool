@@ -1260,11 +1260,15 @@ class HHBot:
             for key in SERVER_CONFIG_KEYS:
                 if key in cfg:
                     uploaded.pop(key, None)
+            old_refresh = (cfg.get("token") or {}).get("refresh_token")
             cfg.save(uploaded)
             # Автоответчик держит старый токен в памяти и при выходе записал бы
             # его обратно — перезапускаем, планировщик поднимет его снова
             self.runner.stop("autoresponder")
             has_token = bool((uploaded.get("token") or {}).get("access_token"))
+            new_refresh = (uploaded.get("token") or {}).get("refresh_token")
+            if has_token and new_refresh != old_refresh:
+                self.reset_quota_for_new_login()
             self.api.send_message(
                 chat_id,
                 "✅ config.json загружен"
@@ -1589,6 +1593,19 @@ class HHBot:
             if ts > now - QUOTA_WINDOW:
                 times.append(ts)
         return sorted(times)
+
+    def reset_quota_for_new_login(self) -> None:
+        """Новый вход (возможно, другой аккаунт hh) — свой лимит 200 за сутки.
+
+        Старый журнал откладываем, а не удаляем: если это повторный вход в
+        тот же аккаунт, лимит hh всё равно не даст отправить лишнее.
+        """
+        if self.sent_times_path.exists():
+            self.sent_times_path.replace(
+                self.sent_times_path.with_name(f"sent_times.{int(time.time())}.txt")
+            )
+        self.state.mark_run("apply_next", 0)
+        logger.info("Новый вход в hh: счётчик лимита откликов начат заново")
 
     def applied_24h(self, now: float | None = None) -> int:
         return len(self.sent_times(now))

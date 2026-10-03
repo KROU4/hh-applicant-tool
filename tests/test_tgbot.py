@@ -808,3 +808,19 @@ def test_run_that_used_its_share_continues_when_slots_free(bot):
     # старые 50 выйдут из окна через ~6 минут, но не раньше 10-минутной паузы
     assert now + 600 - 5 <= resume_at <= now + 700
     assert "Продолжу" in bot.api.sent[-1][1]
+
+
+def test_new_login_resets_quota(bot):
+    write_sent(bot, [time.time() - 60] * 195)
+    bot.api.files["f9"] = json.dumps(
+        {"token": {"access_token": "new", "refresh_token": "other-account"}}
+    ).encode()
+    bot.handle_document(OWNER, {"file_id": "f9", "file_name": "config.json"})
+    assert bot.applied_24h() == 0
+    assert bot.apply_quota_left() == 200
+    assert list(bot.config_path.glob("sent_times.*.txt"))
+
+    # Повторная загрузка того же токена квоту не сбрасывает
+    write_sent(bot, [time.time() - 60] * 10)
+    bot.handle_document(OWNER, {"file_id": "f9", "file_name": "config.json"})
+    assert bot.applied_24h() == 10
