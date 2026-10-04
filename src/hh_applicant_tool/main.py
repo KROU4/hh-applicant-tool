@@ -251,7 +251,10 @@ class HHApplicantTool(MegaTool):
 
     @cached_property
     def log_file(self) -> Path:
-        return self.config_path / LOG_FILENAME
+        # Telegram-бот даёт каждой задаче свой файл: несколько процессов с
+        # ротацией одного файла затирали записи друг друга
+        name = Path(getenv("HH_LOG_FILE") or LOG_FILENAME).name
+        return self.config_path / name
 
     @cached_property
     def cookies_file(self) -> Path:

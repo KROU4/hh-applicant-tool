@@ -1143,9 +1143,13 @@ class HHBot:
                 "✍️ Напишите ответ работодателю — отправлю его в чат hh как есть.\n/cancel — отмена",
             )
         elif action == "logfile":
+            detailed = self.config_path / f"log_{arg}.txt"
             path = (
                 self.config_path / LOG_FILENAME
                 if arg == "main"
+                # Подробный лог задачи (свой файл у каждой), иначе её вывод
+                else detailed
+                if detailed.exists()
                 else self.runner.logs_dir / f"{arg}.log"
             )
             if path.exists():

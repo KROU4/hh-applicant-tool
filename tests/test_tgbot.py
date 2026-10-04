@@ -835,3 +835,21 @@ def test_priority_settings_go_to_apply_args(bot, tmp_path):
     ns = HHApplicantTool()._parser.parse_args(args)
     assert ns.recommended_first and ns.priority_area == ["16"]
     assert "Беларусь" in bot.render("settings")[0]
+
+
+def test_each_task_gets_own_log_file(tmp_path):
+    from hh_applicant_tool.tgbot.runner import TaskRunner
+
+    runner = TaskRunner(tmp_path, lambda task, code: None)
+    assert runner._env("apply")["HH_LOG_FILE"] == "log_apply.txt"
+    assert runner._env()["HH_LOG_FILE"] == "log_cli.txt"
+
+
+def test_tool_log_file_follows_env(tmp_path, monkeypatch):
+    from hh_applicant_tool.main import HHApplicantTool
+
+    tool = HHApplicantTool()
+    tool.config_dir = tmp_path
+    tool.profile_id = None
+    monkeypatch.setenv("HH_LOG_FILE", "log_apply.txt")
+    assert tool.log_file == tmp_path.resolve() / "log_apply.txt"
