@@ -389,3 +389,16 @@ def test_other_countries_remote_only_and_recommendations_in_region():
     op.other_areas = "none"
     list(op._get_vacancies(resume_id="r1"))
     assert len(calls) == 2
+
+
+def test_title_search_ignores_keywords_in_snippet():
+    op = _make_operation(max_responses=0)
+    op.included_filter = r"python|\bml"
+    op.search_field = ["name"]
+    assistant = {
+        **_make_vacancy(1),
+        "name": "Ассистент Помощник",
+        "snippet": {"requirement": "Знание Python и ML", "responsibility": ""},
+    }
+    assert not op._is_included(assistant)
+    assert op._is_included({**_make_vacancy(2), "name": "ML-инженер"})

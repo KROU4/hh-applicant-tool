@@ -1485,6 +1485,26 @@ class HHBot:
                 + datetime.fromtimestamp(resume_at, self.tz).strftime("%d.%m в %H:%M")
                 + ", когда освободятся места."
             )
+        elif (
+            task.name == "apply"
+            and code == 0
+            and not dry_run
+            and not task.stopped_by_user
+        ):
+            # Лимит не упёрся — значит, подходящие вакансии кончились. Не
+            # перебираем их заново, а спим до следующей суточной проверки
+            every = self.state.get("schedule", "apply_every_hours") * 3600
+            resume_at = max(
+                self.state.last_run("apply_next"),
+                self.next_apply_time(time.time(), every),
+            )
+            self.state.mark_run("apply_next", resume_at)
+            limit_note = (
+                "\n\n💤 Подходящих вакансий больше нет — жду новых. Следующая "
+                "проверка "
+                + datetime.fromtimestamp(resume_at, self.tz).strftime("%d.%m в %H:%M")
+                + "."
+            )
         retry_note = ""
         if (
             task.name == "apply"

@@ -829,3 +829,16 @@ def test_owner_can_reply_to_interview_from_telegram(bot):
     bot.handle_update(callback("ansin:5666562040"))
     bot.handle_update(message("Да, завтра в 15:00 удобно"))
     assert calls[-1] == ["autoresponder", "--send-chat", "5666562040", "--text=Да, завтра в 15:00 удобно"]
+
+
+def test_run_without_more_vacancies_sleeps_until_next_day(bot):
+    write_sent(bot, [time.time() - 60] * 30)
+    log = "📨 Отправили отклик на вакансию https://hh.ru/vacancy/1\n" * 3
+    (bot.runner.logs_dir / "apply.log").write_text(log, encoding="utf-8")
+    # Прогону дали 170 мест, отправил 3 — вакансии кончились, лимит ни при чём
+    task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies", "--max-responses", "170"])
+    task.proc.alive = False
+    bot.state.mark_run("apply_next", 0)
+    bot._on_task_finish(task, 0)
+    assert bot.state.last_run("apply_next") > time.time() + 6 * 3600
+    assert "💤 Подходящих вакансий больше нет" in bot.api.sent[-1][1]
