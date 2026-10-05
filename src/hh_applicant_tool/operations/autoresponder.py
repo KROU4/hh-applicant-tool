@@ -59,6 +59,14 @@ INTERVIEW_RE = re.compile(
     r"оффер|offer|приглаша",
     re.IGNORECASE,
 )
+# Вежливый отказ тоже упоминает «интервью» и «пригласить» — такое не сигнал
+REJECTION_RE = re.compile(
+    r"к сожалению|не (готовы|можем|сможем) (вас |Вас )?(пригласить|продолжить|предложить)|"
+    r"вернемся к вашей|вернёмся к вашей|выбрали друг|другого кандидата|"
+    r"не подходит|не соответству|unfortunately|not (be )?moving forward|"
+    r"decided to (proceed|move forward) with other",
+    re.IGNORECASE,
+)
 # Конец блока события в выводе (его разбирает Telegram-бот)
 EVENT_END = "=== конец ==="
 
@@ -303,7 +311,10 @@ class Operation(BaseOperation):
         state = (last.get("workflowTransition") or {}).get("applicantState") or ""
         by_human = not display.get("isBot")
         signal = state.upper() in INTERVIEW_STATES or (
-            by_human and bool(INTERVIEW_RE.search(text))
+            by_human
+            and state.upper() != "DISCARD"
+            and bool(INTERVIEW_RE.search(text))
+            and not REJECTION_RE.search(text)
         )
         if not signal or self.interview_notified(message_id):
             return

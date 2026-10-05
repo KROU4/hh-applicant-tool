@@ -356,3 +356,20 @@ def test_bot_survey_and_plain_messages_are_not_interviews(capsys):
     )
     op.check_interview(_interview_item(23, "Спасибо, резюме рассмотрим", message_id=4), VACANCIES)
     assert "🎯" not in capsys.readouterr().out
+
+
+def test_polite_rejection_is_not_an_interview(capsys):
+    op = make_operation()
+    rejection = (
+        "Добрый день, Дмитрий. Большое спасибо за интерес, проявленный к нашей вакансии. "
+        "К сожалению, в настоящий момент мы не готовы пригласить Вас на дальнейшее интервью. "
+        "Возможно, вернемся к Вашей кандидатуре, когда возникнет потребность."
+    )
+    op.check_interview(_interview_item(24, rejection, message_id=5), VACANCIES)
+    op.check_interview(_interview_item(25, "Приглашаем на интервью", state="DISCARD", message_id=6), VACANCIES)
+    op.check_interview(
+        _interview_item(26, "Приглашаем на интервью завтра. Если не сможете, предложите время", message_id=7),
+        VACANCIES,
+    )
+    out = capsys.readouterr().out
+    assert out.count("🎯") == 1 and "Чат: 26" in out
