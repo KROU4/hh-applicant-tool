@@ -29,6 +29,8 @@ DEFAULTS: dict[str, Any] = {
         "recommended_first": True,
         # Регион (area id), вакансии из которого обрабатываются первыми
         "priority_area": None,
+        # Вакансии вне приоритетного региона: all | remote | none
+        "other_areas": "remote",
         "max_responses": None,
         "resume_id": None,
         "resume_title": None,

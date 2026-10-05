@@ -43,6 +43,8 @@ WORK_FORMATS = [None, "REMOTE", "HYBRID", "REMOTE,HYBRID"]
 # Регион, вакансии из которого идут первыми (area id hh)
 PRIORITY_AREAS = [None, "16", "113", "40"]
 PRIORITY_AREA_TITLES = {None: "нет", "16": "Беларусь", "113": "Россия", "40": "Казахстан"}
+OTHER_AREAS = ["remote", "none", "all"]
+OTHER_AREAS_TITLES = {"remote": "только удалёнка", "none": "не искать", "all": "все вакансии"}
 WORK_FORMAT_TITLES = {
     None: "любой",
     "REMOTE": "удалёнка",
@@ -132,7 +134,7 @@ DRY_RUN_RE = re.compile(r"(🧪 Тест: .*?)\n=== конец ===", re.S)
 DRY_RUN_LIMIT = 5
 # События автоответчика (ответил / нужен человек) из его вывода
 CHAT_EVENT_END = "=== конец ===".encode()
-CHAT_EVENT_RE = re.compile(r"((?:🙋|💬)[^\n]*\n.*?)\n=== конец ===", re.S)
+CHAT_EVENT_RE = re.compile(r"((?:🙋|💬|🎯)[^\n]*\n.*?)\n=== конец ===", re.S)
 
 WELCOME_IMAGE = "welcome.jpg"
 WELCOME_TEXT = (
@@ -314,6 +316,7 @@ def build_apply_args(settings: dict[str, Any], letter_path: Path) -> list[str]:
         args.append("--recommended-first")
     if settings.get("priority_area"):
         args += ["--priority-area", str(settings["priority_area"])]
+        args += ["--other-areas", settings.get("other_areas") or "all"]
     return args
 
 
@@ -713,6 +716,7 @@ class HHBot:
             f"🔤 Искать: {'только в названии' if s.get('search_in_name') else 'везде (название и описание)'}",
             f"⭐ Сначала рекомендации hh: {on_off(s.get('recommended_first'))}",
             f"🗺 Сначала регион: {PRIORITY_AREA_TITLES.get(s.get('priority_area'), s.get('priority_area'))}",
+            f"🌐 Другие страны: {OTHER_AREAS_TITLES.get(s.get('other_areas') or 'all')}",
             f"   запрос в hh: <code>{esc(s['search'] or regex_to_query(s.get('included_filter') or '') or '—')}</code>",
             f"🚫 Стоп-слова: {esc(s['excluded_filter']) or '—'}",
             f"📄 Резюме: {esc(s['resume_title'] or 'все опубликованные')}",
@@ -755,6 +759,12 @@ class HHBot:
                     f"🗺 Регион: {PRIORITY_AREA_TITLES.get(s.get('priority_area'), s.get('priority_area'))}",
                     "cycle:priority_area",
                 ),
+            ],
+            [
+                button(
+                    f"🌐 Другие страны: {OTHER_AREAS_TITLES.get(s.get('other_areas') or 'all')}",
+                    "cycle:other_areas",
+                )
             ],
             [
                 button("🌍 Формат", "cycle:work_format"),
@@ -1082,6 +1092,7 @@ class HHBot:
                 "ai_filter": AI_FILTERS,
                 "work_format": WORK_FORMATS,
                 "priority_area": PRIORITY_AREAS,
+                "other_areas": OTHER_AREAS,
                 "experience": EXPERIENCES,
             }[arg]
             self.state.set("apply", arg, cycle(options, self.state.get("apply", arg)))
@@ -1688,8 +1699,9 @@ class HHBot:
         text = ANSI_RE.sub("", complete.decode("utf-8", "replace"))
         for block in CHAT_EVENT_RE.findall(text):
             head, _, body = block.partition("\n")
-            # Обычные ответы видны в 📜 Логи; уведомляем только когда нужен владелец
-            if not head.startswith("🙋"):
+            # В Telegram — только то, что предвещает собеседование или оффер;
+            # ответы автоответчика и его вопросы видны в 📜 Логи
+            if not head.startswith("🎯"):
                 continue
             fields = dict(
                 line.split(": ", 1)
@@ -1713,9 +1725,8 @@ class HHBot:
                     [button("✍️ Ответить самому", f"ansin:{chat_id}")],
                 ]
             hint = (
-                "\n\n👉 Робот ждёт ответа кнопкой — выберите вариант, бот отправит его в чат."
-                if options
-                else "\n\n👉 Бот перевёл разговор в Telegram. Можно ответить в чат hh прямо отсюда."
+                "\n\n👉 Похоже на собеседование. Автоответчик продолжает переписку; "
+                "ответить работодателю можно и отсюда."
             )
             self.notify(
                 f"<b>{esc(head)}</b>\n{esc(visible[:3500])}{hint}",

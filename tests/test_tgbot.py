@@ -507,42 +507,6 @@ def test_dry_run_report_sends_each_letter(bot):
     assert "&lt;b&gt;RAG&lt;/b&gt;" in texts[2]
 
 
-def test_chat_events_are_forwarded_once(bot):
-    log = bot.runner.logs_dir / "autoresponder.log"
-    log.write_text("старое событие\n", encoding="utf-8")
-    bot.forward_chat_events()  # первый проход: старое не пересылаем
-    assert bot.api.sent == []
-
-    with log.open("a", encoding="utf-8") as fp:
-        fp.write(
-            "🙋 Нужно ваше решение: «AI Engineer» — Лайфтех\nhttps://hh.ru/vacancy/1\n"
-            "Работодатель (Анна): Какая зарплата?\nОтвет: Обсудим в Telegram\n=== конец ===\n"
-            "💬 Ответил в чате: «ML» — ТГТ\nhttps://hh.ru/vacancy/2\n"
-            "Работодатель (Павел): Спасибо\nОтвет: Хорошо\n=== конец ===\n"
-            "💬 Ответил в чате: «незаконченный блок"
-        )
-    bot.forward_chat_events()
-    bot.forward_chat_events()  # повторно ничего не шлём
-
-    texts = [t for _, t, _ in bot.api.sent]
-    # Обычные ответы не пересылаются — только где нужно решение владельца
-    assert len(texts) == 1
-    assert texts[0].startswith("<b>🙋 Нужно ваше решение") and "ответить в чат hh" in texts[0]
-    assert "Какая зарплата?" in texts[0]
-
-
-def test_chat_events_after_log_recreated(bot):
-    log = bot.runner.logs_dir / "autoresponder.log"
-    log.write_text("x" * 500, encoding="utf-8")
-    bot.forward_chat_events()
-    log.write_text(
-        "🙋 Нужно ваше решение: «ML» — ТГТ\nhttps://hh.ru/vacancy/2\nОтвет: Ок\n=== конец ===\n",
-        encoding="utf-8",
-    )
-    bot.forward_chat_events()
-    assert len(bot.api.sent) == 1
-
-
 def test_start_sends_welcome_photo_once_then_by_file_id(bot):
     (bot.config_path / "welcome.jpg").write_bytes(b"jpg")
     bot.handle_update(message("/start"))
@@ -552,38 +516,6 @@ def test_start_sends_welcome_photo_once_then_by_file_id(bot):
     assert second[1] == "big-id"
     # После приветствия — панель управления
     assert "HH панель управления" in bot.api.sent[-1][1]
-
-
-def test_owner_answers_robot_button_from_telegram(bot):
-    log = bot.runner.logs_dir / "autoresponder.log"
-    log.write_text("", encoding="utf-8")
-    bot.forward_chat_events()
-    with log.open("a", encoding="utf-8") as fp:
-        fp.write(
-            "🙋 Нужно ваше решение: «AI-разработчик» — Инфогород\n"
-            "https://hh.ru/vacancy/1\n"
-            "Работодатель (Робот-рекрутер): Готовы ли к офисному формату?\n"
-            "Ответ: не отправлен — выберите вариант\n"
-            "Чат: 5666562040\nКнопки: да | нет\n=== конец ===\n"
-        )
-    bot.forward_chat_events()
-    _, text, markup = bot.api.sent[-1]
-    assert "Чат:" not in text and "Робот ждёт ответа кнопкой" in text
-    buttons = markup["inline_keyboard"]
-    assert [b["callback_data"] for b in buttons[0]] == ["ans:5666562040:0", "ans:5666562040:1"]
-
-    bot.runner.sync_result = (0, "Отправлено", "")
-    calls = []
-    bot.runner.run_sync = lambda args, timeout=90: calls.append(args) or (0, "ok", "")
-    bot._background = lambda fn: fn()
-    bot.handle_update(callback("ans:5666562040:1"))
-    assert calls[-1] == ["autoresponder", "--send-chat", "5666562040", "--text=нет"]
-    assert "Отправлено в чат hh" in bot.api.sent[-1][1]
-
-    # Свой ответ текстом
-    bot.handle_update(callback("ansin:5666562040"))
-    bot.handle_update(message("Готов обсудить гибрид"))
-    assert calls[-1][-1] == "--text=Готов обсудить гибрид"
 
 
 def test_answers_screen_add_and_replace(bot):
@@ -853,3 +785,47 @@ def test_tool_log_file_follows_env(tmp_path, monkeypatch):
     tool.profile_id = None
     monkeypatch.setenv("HH_LOG_FILE", "log_apply.txt")
     assert tool.log_file == tmp_path.resolve() / "log_apply.txt"
+
+
+
+INTERVIEW_BLOCK = (
+    "🎯 Собеседование (приглашение): «AI Engineer» — hoster.by\n"
+    "https://hh.ru/vacancy/1\n"
+    "Работодатель (Анна): Удобно созвониться завтра в 15:00?\n"
+    "Чат: 5666562040\n=== конец ===\n"
+)
+
+
+def test_only_interview_events_are_forwarded_once(bot):
+    log = bot.runner.logs_dir / "autoresponder.log"
+    log.write_text("старое\n", encoding="utf-8")
+    bot.forward_chat_events()
+    with log.open("a", encoding="utf-8") as fp:
+        fp.write(
+            "🙋 Нужно ваше решение: «ML» — ТГТ\nОтвет: Обсудим в Telegram\n=== конец ===\n"
+            "💬 Ответил в чате: «ML» — ТГТ\nОтвет: Хорошо\n=== конец ===\n"
+            + INTERVIEW_BLOCK
+        )
+    bot.forward_chat_events()
+    bot.forward_chat_events()
+    texts = [t for _, t, _ in bot.api.sent]
+    assert len(texts) == 1
+    assert texts[0].startswith("<b>🎯 Собеседование (приглашение)")
+    assert "Удобно созвониться" in texts[0] and "Чат:" not in texts[0]
+
+
+def test_owner_can_reply_to_interview_from_telegram(bot):
+    log = bot.runner.logs_dir / "autoresponder.log"
+    log.write_text("", encoding="utf-8")
+    bot.forward_chat_events()
+    with log.open("a", encoding="utf-8") as fp:
+        fp.write(INTERVIEW_BLOCK)
+    bot.forward_chat_events()
+    markup = bot.api.sent[-1][2]
+    assert markup["inline_keyboard"][-1][0]["callback_data"] == "ansin:5666562040"
+
+    calls = []
+    bot.runner.run_sync = lambda args, timeout=90: calls.append(args) or (0, "ok", "")
+    bot.handle_update(callback("ansin:5666562040"))
+    bot.handle_update(message("Да, завтра в 15:00 удобно"))
+    assert calls[-1] == ["autoresponder", "--send-chat", "5666562040", "--text=Да, завтра в 15:00 удобно"]

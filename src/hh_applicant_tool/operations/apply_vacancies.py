@@ -145,6 +145,7 @@ class Namespace(BaseNamespace):
     included_filter: str | None
     recommended_first: bool
     priority_area: list[str] | None
+    other_areas: str
     max_responses: int
     send_email: bool
     skip_tests: bool
@@ -262,6 +263,12 @@ class Operation(BaseOperation):
             "--priority-area",
             nargs="+",
             help="Регион (area id), вакансии из которого обрабатываются раньше остальных, например 16 — Беларусь",
+        )
+        parser.add_argument(
+            "--other-areas",
+            choices=["all", "remote", "none"],
+            default="all",
+            help="Вакансии вне --priority-area: все, только удалёнка или никакие",
         )
         parser.add_argument(
             "--included-filter",
@@ -432,6 +439,7 @@ class Operation(BaseOperation):
         self.included_filter = args.included_filter
         self.recommended_first = bool(args.recommended_first)
         self.priority_area = args.priority_area
+        self.other_areas = args.other_areas
         self.experience = args.experience
         self.force_message = args.force_message
         self.industry = args.industry
@@ -1680,12 +1688,24 @@ class Operation(BaseOperation):
         # Сначала самое релевантное: рекомендации hh под это резюме, затем
         # поиск в приоритетном регионе, затем везде. Повторы пропускаем
         sources: list[tuple[str, dict[str, Any]]] = []
-        if getattr(self, "recommended_first", False) and resume_id:
-            sources.append((similar, {"text": None, "search_field": None}))
         priority_area = getattr(self, "priority_area", None)
-        if priority_area and not self.area:
+        if self.area:
+            priority_area = None
+        if getattr(self, "recommended_first", False) and resume_id:
+            # Рекомендации — тоже только из приоритетного региона, иначе hh
+            # подмешивает вакансии из других стран раньше своих
+            recommended = {"text": None, "search_field": None}
+            if priority_area:
+                recommended["area"] = list(priority_area)
+            sources.append((similar, recommended))
+        if priority_area:
             sources.append(("/vacancies", {"area": list(priority_area)}))
-        sources.append(("/vacancies", {}))
+        other_areas = getattr(self, "other_areas", None) or "all"
+        if not priority_area or other_areas == "all":
+            sources.append(("/vacancies", {}))
+        elif other_areas == "remote":
+            # Из других стран интересна только удалёнка
+            sources.append(("/vacancies", {"work_format": ["REMOTE"]}))
 
         seen: set[str] = set()
         for url, overrides in sources:

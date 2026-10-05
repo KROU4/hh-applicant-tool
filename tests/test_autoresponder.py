@@ -247,30 +247,6 @@ def test_pick_option():
     assert pick_option("Скорее всего", ["Готов", "Не готов"]) == "Готов"
 
 
-def test_human_button_question_waits_for_owner_once(capsys):
-    op = make_operation()
-    chat = op.parse_chat_item(chat_item(12, is_bot=True), VACANCIES, {}, RESUMES[1])
-    office = {
-        "id": 777,
-        "participantId": "90236278",
-        "text": "Готовы ли к офисному формату м. Курская?",
-        "participantDisplay": {"isBot": True, "name": "Робот-рекрутер"},
-        "actions": {"text_buttons": [{"text": "да"}, {"text": "нет"}]},
-    }
-    _robot_chat(op, [office])
-    ai = op.tool.get_cover_letter_ai.return_value
-    ai.complete.return_value = "[НУЖЕН_ЧЕЛОВЕК] Формат обсудим в Telegram"
-
-    op.reply_to_chat(chat)
-    op.reply_to_chat(chat)  # следующая проверка — сообщение уже разобрано
-
-    op._post.assert_not_called()
-    assert ai.complete.call_count == 1
-    out = capsys.readouterr().out
-    assert out.count("🙋 Нужно ваше решение") == 1
-    assert "Чат: 12" in out and "Кнопки: да | нет" in out
-
-
 def test_no_reply_is_remembered():
     op = make_operation()
     chat = op.parse_chat_item(chat_item(13), VACANCIES, {}, RESUMES[1])
@@ -332,3 +308,51 @@ def test_vacancy_area_is_in_prompt():
     chat = op.parse_chat_item(chat_item(16), vacancies, {}, RESUMES[1])
     assert chat.vacancy_area == "Минск"
     assert "Город вакансии: Минск" in op.build_user_prompt(chat, "история")
+
+
+
+def test_button_question_is_answered_by_bot_itself():
+    op = make_operation()
+    chat = op.parse_chat_item(chat_item(12, is_bot=True), VACANCIES, {}, RESUMES[1])
+    office = {
+        "id": 777,
+        "participantId": "90236278",
+        "text": "Готовы ли к офисному формату м. Курская?",
+        "participantDisplay": {"isBot": True, "name": "Робот-рекрутер"},
+        "actions": {"text_buttons": [{"text": "да"}, {"text": "нет"}]},
+    }
+    _robot_chat(op, [office])
+    op.tool.get_cover_letter_ai.return_value.complete.return_value = "нет"
+    op.reply_to_chat(chat)
+    assert op._post.call_args.args[1]["text"] == "нет"
+
+
+def _interview_item(chat_id, text, *, is_bot=False, state="RESPONSE", message_id=1):
+    item = chat_item(chat_id, text=text, is_bot=is_bot, state=state)
+    item["lastMessage"]["id"] = message_id
+    return item
+
+
+def test_interview_signals_are_reported_once(capsys):
+    op = make_operation()
+    op.check_interview(_interview_item(20, "Когда вам удобно созвониться? Вот ссылка calendly.com/hr"), VACANCIES)
+    op.check_interview(_interview_item(20, "Когда вам удобно созвониться? Вот ссылка calendly.com/hr"), VACANCIES)
+    out = capsys.readouterr().out
+    assert out.count("🎯 Собеседование") == 1
+    assert "«AI / ML-инженер» — Смарт СТиМ Сити" in out and "Чат: 20" in out
+
+
+def test_invitation_state_is_reported_even_without_keywords(capsys):
+    op = make_operation()
+    op.check_interview(_interview_item(21, "", state="INVITATION", message_id=2), VACANCIES)
+    assert "🎯 Собеседование (приглашение)" in capsys.readouterr().out
+
+
+def test_bot_survey_and_plain_messages_are_not_interviews(capsys):
+    op = make_operation()
+    op.check_interview(
+        _interview_item(22, "Чтобы пригласить на интервью, ответьте на вопросы", is_bot=True, message_id=3),
+        VACANCIES,
+    )
+    op.check_interview(_interview_item(23, "Спасибо, резюме рассмотрим", message_id=4), VACANCIES)
+    assert "🎯" not in capsys.readouterr().out

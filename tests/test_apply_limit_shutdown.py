@@ -361,3 +361,31 @@ def test_vacancy_sources_priority_and_dedup():
     assert "text" not in calls[0][1] and "search_field" not in calls[0][1]
     assert calls[1][1]["area"] == ["16"] and calls[1][1]["text"] == "llm"
     assert "area" not in calls[2][1]
+
+
+
+def test_other_countries_remote_only_and_recommendations_in_region():
+    op = _make_operation(max_responses=0)
+    op.search = "llm"
+    op.area = None
+    op.recommended_first = True
+    op.priority_area = ["16"]
+    op.other_areas = "remote"
+    op.total_pages = 1
+    calls = []
+
+    def api_get(url, params, *a, **k):
+        calls.append((url, dict(params)))
+        return {"items": [], "found": 0, "pages": 1}
+
+    op.tool.api_client.get.side_effect = api_get
+    op._get_search_params = lambda page: {"page": page, "text": "llm"}
+    list(op._get_vacancies(resume_id="r1"))
+    assert calls[0][0].endswith("similar_vacancies") and calls[0][1]["area"] == ["16"]
+    assert calls[1][1]["area"] == ["16"]
+    assert calls[2][1]["work_format"] == ["REMOTE"] and "area" not in calls[2][1]
+
+    calls.clear()
+    op.other_areas = "none"
+    list(op._get_vacancies(resume_id="r1"))
+    assert len(calls) == 2

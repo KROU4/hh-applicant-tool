@@ -41,6 +41,24 @@ MAX_SAME_QUESTION = 3
 HANDLED_FILENAME = "autoresponder_handled.json"
 # Решения соискателя по типовым вопросам рекрутеров (правится из бота)
 ANSWERS_FILENAME = "candidate_answers.txt"
+# Сообщения, о которых владелец уже получил уведомление «🎯 Собеседование»
+INTERVIEW_NOTIFIED_FILENAME = "interview_notified.json"
+# Статусы отклика, означающие приглашение или оффер
+INTERVIEW_STATES = {"INVITATION", "INTERVIEW", "OFFER", "HIRED"}
+INTERVIEW_STATE_TITLES = {
+    "INVITATION": "приглашение",
+    "INTERVIEW": "приглашение на интервью",
+    "OFFER": "оффер",
+    "HIRED": "выход на работу",
+}
+# Признаки собеседования или оффера в тексте работодателя
+INTERVIEW_RE = re.compile(
+    r"собеседован|интервью|interview|созвон|видеозвон|звонок|встреч[уаи]|"
+    r"zoom|teams\.|google meet|meet\.google|telemost|телемост|calendly|cal\.com|"
+    r"calendar|календар|удобное (для вас )?время|выберите (удобный )?слот|"
+    r"оффер|offer|приглаша",
+    re.IGNORECASE,
+)
 # Конец блока события в выводе (его разбирает Telegram-бот)
 EVENT_END = "=== конец ==="
 
@@ -253,6 +271,10 @@ class Operation(BaseOperation):
                 if self.is_too_old(item):
                     too_old = True
                     continue
+                try:
+                    self.check_interview(item, vacancies)
+                except Exception:
+                    logger.exception("Ошибка проверки на собеседование")
                 chat = self.parse_chat_item(item, vacancies, by_real_id, resumes[0])
                 if chat is not None:
                     result.append(chat)
@@ -262,6 +284,65 @@ class Operation(BaseOperation):
             if too_old or not cursor:
                 break
         return result
+
+    def check_interview(self, item: dict[str, Any], vacancies: dict[str, Any]) -> None:
+        """Сигналы собеседования или оффера — владельцу в Telegram, один раз.
+
+        Смотрим последнее сообщение работодателя-человека (боты-рекрутеры
+        шаблонно упоминают «интервью» в каждом опросе) и смену статуса
+        отклика на приглашение или оффер.
+        """
+        last = item.get("lastMessage") or {}
+        message_id = last.get("id")
+        if not message_id or str(last.get("participantId")) == str(
+            item.get("currentParticipantId")
+        ):
+            return
+        display = last.get("participantDisplay") or {}
+        text = (last.get("text") or "").strip()
+        state = (last.get("workflowTransition") or {}).get("applicantState") or ""
+        by_human = not display.get("isBot")
+        signal = state.upper() in INTERVIEW_STATES or (
+            by_human and bool(INTERVIEW_RE.search(text))
+        )
+        if not signal or self.interview_notified(message_id):
+            return
+
+        vacancy_id = first((item.get("resources") or {}).get("VACANCY"))
+        vacancy = vacancies.get(str(vacancy_id)) or {}
+        company = vacancy.get("company") or {}
+        reason = INTERVIEW_STATE_TITLES.get(state.upper(), "сообщение о собеседовании")
+        print(
+            f"🎯 Собеседование ({reason}): «{vacancy.get('name') or 'вакансия'}» — "
+            f"{company.get('visibleName') or company.get('name') or ''}\n"
+            f"{(vacancy.get('links') or {}).get('desktop') or ''}\n"
+            f"Работодатель ({display.get('name') or 'HR'}): {text or '—'}\n"
+            f"Чат: {item.get('id')}\n{EVENT_END}",
+            flush=True,
+        )
+        if not self.args.dry_run:
+            self.mark_interview_notified(message_id)
+
+    @cached_property
+    def _interview_path(self) -> Path:
+        return self.tool.config_path / INTERVIEW_NOTIFIED_FILENAME
+
+    def interview_notified(self, message_id: Any) -> bool:
+        try:
+            seen = json.loads(self._interview_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        return message_id in seen
+
+    def mark_interview_notified(self, message_id: Any) -> None:
+        try:
+            seen = json.loads(self._interview_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            seen = []
+        seen = (seen + [message_id])[-500:]
+        tmp = self._interview_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(seen), encoding="utf-8")
+        tmp.replace(self._interview_path)
 
     def is_too_old(self, item: dict[str, Any]) -> bool:
         last = item.get("lastMessage") or {}
@@ -379,13 +460,6 @@ class Operation(BaseOperation):
             logger.warning("AI вернул пустой ответ для чата %s", chat.chat_id)
             return
 
-        if needs_human and chat.reply_options:
-            # Робот принимает только кнопку, а выбрать её должен сам соискатель:
-            # ничего не пишем, владелец ответит кнопкой из Telegram
-            self.print_event(chat, "", needs_human=True, sent=False)
-            if not self.args.dry_run:
-                self.mark_handled(chat.chat_id, last.get("id"))
-            return
         if chat.reply_options:
             # Робот-рекрутер принимает только текст кнопки, иначе переспрашивает
             reply = pick_option(reply, chat.reply_options)
