@@ -29,6 +29,7 @@ def _make_vacancy(i: int) -> dict:
 
 def _make_operation(max_responses: int = 5) -> Operation:
     op = Operation()
+    op.vacancy_fetch_delay = (0.0, 0.0)
     # Namespace-like args used by _apply_resume.
     # NOTE: `args` is a read-only property backed by `_args` (set in run()).
     op._args = SimpleNamespace(
@@ -263,3 +264,141 @@ class TestExcludedAndNetworkErrors:
         # 1 и 4 — отклик; 2 — стоп-слово из API; 3 — сетевая ошибка, но прогон жив
         assert op.tool.api_client.post.call_count == 2
         assert not op.tool.session.get.called
+
+
+class TestCaptchaPause:
+    def test_captcha_pauses_run_without_marking_vacancies_skipped(self, capsys):
+        from hh_applicant_tool.api.errors import CaptchaRequired
+
+        op = _make_operation(max_responses=0)
+        op.included_filter = r"llm"
+
+        def api_get(url, *a, **k):
+            if url == "/vacancies/2":
+                raise CaptchaRequired(MagicMock(), {"errors": [{"value": "captcha_required", "captcha_url": "https://hh.ru/account/captcha"}]})
+            return {"description": "LLM"}
+
+        op.tool.api_client.get.side_effect = api_get
+        op._get_vacancies = lambda resume_id=None: iter(_make_vacancy(i) for i in range(1, 6))
+        resume = {"id": "r1", "title": "Dev", "alternate_url": "u"}
+        user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+        op._apply_resume(resume=resume, user=user, seen_employers=set())
+
+        assert op.captcha_paused
+        assert op.tool.api_client.post.call_count == 1  # только вакансия 1
+        assert not op.tool.storage.skipped_vacancies.save.called
+        assert "hh запросил капчу" in capsys.readouterr().out
+
+    def test_vacancy_is_fetched_once_per_run(self):
+        op = _make_operation(max_responses=0)
+        op.included_filter = r"llm"
+        op.excluded_filter = r"php"
+        op.tool.api_client.get.return_value = {"description": "LLM"}
+        assert op._is_included(_make_vacancy(7))
+        assert not op._is_excluded(_make_vacancy(7))
+        urls = [c.args[0] for c in op.tool.api_client.get.call_args_list]
+        assert urls.count("/vacancies/7") == 1
+
+
+def test_vacancy_is_dropped_from_cache_after_processing():
+    op = _make_operation(max_responses=0)
+    op.included_filter = r"llm"
+    op.tool.api_client.get.return_value = {"description": "LLM"}
+    op._get_vacancies = lambda resume_id=None: iter(_make_vacancy(i) for i in range(1, 4))
+    resume = {"id": "r1", "title": "Dev", "alternate_url": "u"}
+    user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+    op._apply_resume(resume=resume, user=user, seen_employers=set())
+    assert op.tool.api_client.post.call_count == 3
+    assert op.__dict__.get("_vacancy_cache", {}) == {}
+
+
+def test_title_search_checks_keywords_without_opening_vacancy():
+    op = _make_operation(max_responses=0)
+    op.included_filter = r"llm"
+    op.search_field = ["name"]
+    assert op._is_included({**_make_vacancy(1), "name": "LLM Engineer"})
+    assert not op._is_included({**_make_vacancy(2), "name": "Менеджер по продажам"})
+    assert not op.tool.api_client.get.called
+
+
+
+def test_sent_responses_are_timestamped(tmp_path):
+    op = _make_operation(max_responses=3)
+    op.tool.config_path = tmp_path
+    op._get_vacancies = lambda resume_id=None: iter(_make_vacancy(i) for i in range(10))
+    resume = {"id": "r1", "title": "Dev", "alternate_url": "u"}
+    user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+    op._apply_resume(resume=resume, user=user, seen_employers=set())
+    assert len((tmp_path / "sent_times.txt").read_text().split()) == 3
+
+
+def test_vacancy_sources_priority_and_dedup():
+    op = _make_operation(max_responses=0)
+    op.search = "llm"
+    op.search_field = ["name"]
+    op.area = None
+    op.recommended_first = True
+    op.priority_area = ["16"]
+    op.total_pages = 1
+    calls = []
+
+    def api_get(url, params, *a, **k):
+        calls.append((url, params))
+        if "similar_vacancies" in url:
+            items = [{"id": "1"}, {"id": "2"}]
+        elif params.get("area") == ["16"]:
+            items = [{"id": "2"}, {"id": "3"}]
+        else:
+            items = [{"id": "3"}, {"id": "4"}]
+        return {"items": items, "found": len(items), "pages": 1}
+
+    op.tool.api_client.get.side_effect = api_get
+    op._get_search_params = lambda page: {"page": page, "text": "llm", "search_field": ["name"]}
+    ids = [v["id"] for v in op._get_vacancies(resume_id="r1")]
+
+    assert ids == ["1", "2", "3", "4"]
+    assert calls[0][0] == "/resumes/r1/similar_vacancies"
+    assert "text" not in calls[0][1] and "search_field" not in calls[0][1]
+    assert calls[1][1]["area"] == ["16"] and calls[1][1]["text"] == "llm"
+    assert "area" not in calls[2][1]
+
+
+
+def test_other_countries_remote_only_and_recommendations_in_region():
+    op = _make_operation(max_responses=0)
+    op.search = "llm"
+    op.area = None
+    op.recommended_first = True
+    op.priority_area = ["16"]
+    op.other_areas = "remote"
+    op.total_pages = 1
+    calls = []
+
+    def api_get(url, params, *a, **k):
+        calls.append((url, dict(params)))
+        return {"items": [], "found": 0, "pages": 1}
+
+    op.tool.api_client.get.side_effect = api_get
+    op._get_search_params = lambda page: {"page": page, "text": "llm"}
+    list(op._get_vacancies(resume_id="r1"))
+    assert calls[0][0].endswith("similar_vacancies") and calls[0][1]["area"] == ["16"]
+    assert calls[1][1]["area"] == ["16"]
+    assert calls[2][1]["work_format"] == ["REMOTE"] and "area" not in calls[2][1]
+
+    calls.clear()
+    op.other_areas = "none"
+    list(op._get_vacancies(resume_id="r1"))
+    assert len(calls) == 2
+
+
+def test_title_search_ignores_keywords_in_snippet():
+    op = _make_operation(max_responses=0)
+    op.included_filter = r"python|\bml"
+    op.search_field = ["name"]
+    assistant = {
+        **_make_vacancy(1),
+        "name": "Ассистент Помощник",
+        "snippet": {"requirement": "Знание Python и ML", "responsibility": ""},
+    }
+    assert not op._is_included(assistant)
+    assert op._is_included({**_make_vacancy(2), "name": "ML-инженер"})

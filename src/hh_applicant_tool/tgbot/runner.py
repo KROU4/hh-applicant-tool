@@ -71,9 +71,16 @@ class TaskRunner:
             *args,
         ]
 
-    def _env(self) -> dict[str, str]:
+    def _env(self, log_name: str = "cli") -> dict[str, str]:
         env = dict(os.environ)
-        env.update(PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8", TERM="dumb")
+        env.update(
+            PYTHONUNBUFFERED="1",
+            PYTHONIOENCODING="utf-8",
+            TERM="dumb",
+            # Свой лог-файл на задачу: ротация общего файла из нескольких
+            # процессов затирала записи
+            HH_LOG_FILE=f"log_{log_name}.txt",
+        )
         env.pop("HH_PROFILE_ID", None)
         return env
 
@@ -97,7 +104,7 @@ class TaskRunner:
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,
-                    env=self._env(),
+                    env=self._env(name),
                     start_new_session=os.name == "posix",
                 )
             finally:

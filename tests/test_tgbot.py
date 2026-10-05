@@ -41,7 +41,7 @@ class FakeAPI:
     def download_file(self, file_id):
         return self.files[file_id]
 
-    def send_photo(self, chat_id, photo, caption=None):
+    def send_photo(self, chat_id, photo, caption=None, reply_markup=None):
         self.photos.append((chat_id, photo, caption))
         return {"photo": [{"file_id": "small"}, {"file_id": "big-id"}]}
 
@@ -111,6 +111,13 @@ class FakeRunner:
 
 
 OWNER = 111
+
+
+def today_ts() -> float:
+    """Полдень сегодня: тест не зависит от того, запущен ли он около полуночи."""
+    from datetime import datetime as _dt
+
+    return _dt.now().replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
 
 
 @pytest.fixture
@@ -213,7 +220,7 @@ def test_first_start_claims_owner(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "screen", ["main", "settings", "schedule", "stats", "logs", "ai", "account"]
+    "screen", ["main", "settings", "schedule", "stats", "logs", "ai", "account", "answers"]
 )
 def test_all_screens_render(bot, screen):
     text, markup = bot.render(screen)
@@ -296,18 +303,6 @@ def test_scheduler_idle_without_token(bot):
     bot.state.set("schedule", "apply_enabled", True)
     bot.tick()
     assert bot.runner.started == []
-
-
-def test_apply_finish_counts_responses(bot):
-    log = bot.runner.logs_dir / "apply.log"
-    log.write_text(
-        "[I] шум\n✅️ Закончили рассылку для резюме: Python. Отправлено: 7\n",
-        encoding="utf-8",
-    )
-    task = bot.runner.start("apply", "🚀 Отклики", [])
-    bot._on_task_finish(task, 0)
-    assert bot.applied_24h() == 7
-    assert "Отправлено откликов: <b>7</b>" in bot.api.sent[-1][1]
 
 
 def test_in_hours_wraps_midnight():
@@ -413,58 +408,31 @@ def _max_responses(args: list[str]) -> int:
     return int(args[args.index("--max-responses") + 1])
 
 
-def test_apply_run_is_capped_by_daily_quota(bot):
-    bot.state.set("runs", "applied_log", [[time.time() - 3600, 150]])
-    bot.handle_update(callback("run:apply"))
-    args = bot.runner.started[-1][1]
-    assert _max_responses(args) == 50
-    assert args.count("--max-responses") == 1
-
-
 def test_own_run_limit_is_kept_when_smaller(bot):
     bot.state.set("apply", "max_responses", 30)
     bot.start_task("apply")
     assert _max_responses(bot.runner.started[-1][1]) == 30
 
 
-def test_quota_exhausted_blocks_manual_and_scheduled_runs(bot):
-    bot.state.set("runs", "applied_log", [[time.time() - 60, 200]])
-    assert bot.start_task("apply") == "Суточный лимит откликов уже набран"
+def test_daily_schedule_runs_next_morning(bot):
+    from datetime import datetime as _dt, timedelta as _td
 
     bot.state.set("schedule", "apply_enabled", True)
     bot.state.set("schedule", "hours_from", 0)
     bot.state.set("schedule", "hours_to", 0)
-    bot.state.set("schedule", "update_resumes_enabled", False)
-    now = time.time()
+    now = today_ts() + 8 * 3600  # вечер
     bot.tick(now)
-    assert "apply" not in [name for name, _, _ in bot.runner.started]
-    assert bot.state.last_run("apply_next") == pytest.approx(now + 3600)
+    run_at = _dt.fromtimestamp(bot.state.last_run("apply_next"))
+    tomorrow = (_dt.fromtimestamp(now) + _td(days=1)).date()
+    assert run_at.date() == tomorrow and run_at.hour == 0
 
 
-def test_quota_window_is_rolling_24h(bot):
-    now = time.time()
-    bot.state.set(
-        "runs", "applied_log", [[now - 25 * 3600, 200], [now - 3600, 20]]
-    )
-    assert bot.applied_24h(now) == 20
-    assert bot.apply_quota_left(now) == 180
+def test_daily_schedule_uses_window_start(bot):
+    from datetime import datetime as _dt
 
-
-def test_daily_schedule_next_run_in_24_to_25_hours(bot):
-    bot.state.set("schedule", "apply_enabled", True)
-    bot.state.set("schedule", "hours_from", 0)
-    bot.state.set("schedule", "hours_to", 0)
-    now = time.time()
-    bot.tick(now)
-    next_run = bot.state.last_run("apply_next") - now
-    assert 24 * 3600 < next_run <= 25 * 3600
-
-
-def test_dry_run_is_not_counted(bot):
-    (bot.runner.logs_dir / "apply.log").write_text("Отправлено: 9\n", encoding="utf-8")
-    task = bot.runner.start("apply", "🚀", ["apply-vacancies", "--dry-run"])
-    bot._on_task_finish(task, 0)
-    assert bot.applied_24h() == 0
+    bot.state.set("schedule", "hours_from", 9)
+    run_at = _dt.fromtimestamp(bot.next_apply_time(today_ts(), 24 * 3600))
+    assert run_at.hour == 9 and 1 <= run_at.minute * 60 + run_at.second <= 3600
 
 
 def test_daily_limit_input(bot):
@@ -518,14 +486,6 @@ def test_keywords_drive_search_and_filter(bot, tmp_path):
     assert HHApplicantTool()._parser.parse_args(args).search == "python"
 
 
-def test_dry_run_is_limited_and_ignores_quota(bot):
-    bot.state.set("apply", "dry_run", True)
-    bot.state.set("runs", "applied_log", [[time.time() - 60, 200]])
-    assert bot.start_task("apply") == "Запущено"
-    args = bot.runner.started[-1][1]
-    assert _max_responses(args) == 5 and "--dry-run" in args
-
-
 def test_dry_run_report_sends_each_letter(bot):
     log = (
         "🚀 Начинаю рассылку откликов для резюме: Senior AI Engineer\n"
@@ -545,65 +505,6 @@ def test_dry_run_report_sends_each_letter(bot):
     assert texts[1].startswith("<b>«LLM Engineer» — Лайфтех</b>\nhttps://hh.ru/vacancy/1")
     assert "Пишу по вакансии." in texts[1]
     assert "&lt;b&gt;RAG&lt;/b&gt;" in texts[2]
-    assert bot.applied_24h() == 0
-
-
-def test_chat_events_are_forwarded_once(bot):
-    log = bot.runner.logs_dir / "autoresponder.log"
-    log.write_text("старое событие\n", encoding="utf-8")
-    bot.forward_chat_events()  # первый проход: старое не пересылаем
-    assert bot.api.sent == []
-
-    with log.open("a", encoding="utf-8") as fp:
-        fp.write(
-            "🙋 Нужно ваше решение: «AI Engineer» — Лайфтех\nhttps://hh.ru/vacancy/1\n"
-            "Работодатель (Анна): Какая зарплата?\nОтвет: Обсудим в Telegram\n=== конец ===\n"
-            "💬 Ответил в чате: «ML» — ТГТ\nhttps://hh.ru/vacancy/2\n"
-            "Работодатель (Павел): Спасибо\nОтвет: Хорошо\n=== конец ===\n"
-            "💬 Ответил в чате: «незаконченный блок"
-        )
-    bot.forward_chat_events()
-    bot.forward_chat_events()  # повторно ничего не шлём
-
-    texts = [t for _, t, _ in bot.api.sent]
-    # Обычные ответы не пересылаются — только где нужно решение владельца
-    assert len(texts) == 1
-    assert texts[0].startswith("<b>🙋 Нужно ваше решение") and "ответить в чат hh" in texts[0]
-    assert "Какая зарплата?" in texts[0]
-
-
-def test_chat_events_after_log_recreated(bot):
-    log = bot.runner.logs_dir / "autoresponder.log"
-    log.write_text("x" * 500, encoding="utf-8")
-    bot.forward_chat_events()
-    log.write_text(
-        "🙋 Нужно ваше решение: «ML» — ТГТ\nhttps://hh.ru/vacancy/2\nОтвет: Ок\n=== конец ===\n",
-        encoding="utf-8",
-    )
-    bot.forward_chat_events()
-    assert len(bot.api.sent) == 1
-
-
-def test_crashed_apply_run_counts_sent_responses(bot):
-    log = "🚀 Начинаю\n" + "📨 Отправили отклик на вакансию https://hh.ru/vacancy/1\n" * 44 + "[E] 403\n"
-    (bot.runner.logs_dir / "apply.log").write_text(log, encoding="utf-8")
-    task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies"])
-    bot._on_task_finish(task, 1)
-    assert bot.applied_24h() == 44
-
-
-def test_failed_apply_run_is_retried_while_quota_left(bot):
-    bot.state.set("schedule", "apply_enabled", True)
-    bot.state.set("runs", "applied_log", [[time.time() - 60, 44]])
-    (bot.runner.logs_dir / "apply.log").write_text("[E] 403 Client Error\n", encoding="utf-8")
-    task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies"])
-    before = time.time()
-
-    bot._on_task_finish(task, 1)
-
-    assert bot.state.last_run("apply_next") == pytest.approx(before + 1800, abs=5)
-    assert "повторю через 30 мин" in bot.api.sent[-1][1]
-    assert "Осталось 156" in bot.api.sent[-1][1]
 
 
 def test_start_sends_welcome_photo_once_then_by_file_id(bot):
@@ -617,33 +518,327 @@ def test_start_sends_welcome_photo_once_then_by_file_id(bot):
     assert "HH панель управления" in bot.api.sent[-1][1]
 
 
-def test_owner_answers_robot_button_from_telegram(bot):
+def test_answers_screen_add_and_replace(bot):
+    text, markup = bot.render("answers")
+    assert "Пока пусто" in text
+
+    bot.handle_update(callback("input:answers_add"))
+    bot.handle_update(message("Формат: только удалёнка"))
+    bot.handle_update(callback("input:answers_add"))
+    bot.handle_update(message("График: любой"))
+    assert bot.answers_path.read_text(encoding="utf-8") == "Формат: только удалёнка\nГрафик: любой\n"
+    assert "График: любой" in bot.render("answers")[0]
+
+    bot.handle_update(callback("input:answers_set"))
+    bot.handle_update(message("-"))
+    assert not bot.answers_path.exists()
+
+
+def test_daily_storage_cleanup(bot):
+    import sqlite3
+
+    con = sqlite3.connect(bot.config_path / "data")
+    con.executescript(
+        "CREATE TABLE vacancies (id INTEGER, updated_at DATETIME);"
+        "CREATE TABLE skipped_vacancies (id INTEGER, created_at DATETIME);"
+        "INSERT INTO vacancies VALUES (1, datetime('now', '-10 days')), (2, datetime('now'));"
+        "INSERT INTO skipped_vacancies VALUES (1, datetime('now', '-40 days')), (2, datetime('now', '-1 day'));"
+    )
+    con.commit()
+    con.close()
+
+    bot.tick()
+    bot.tick()  # второй раз в тот же день ничего не делает
+
+    con = sqlite3.connect(bot.config_path / "data")
+    assert [r[0] for r in con.execute("SELECT id FROM vacancies")] == [2]
+    assert [r[0] for r in con.execute("SELECT id FROM skipped_vacancies")] == [2]
+    con.close()
+    assert bot.state.last_run("cleanup") > 0
+
+
+def test_captcha_is_sent_to_owner_and_answer_resumes_apply(bot):
+    bot.state.set("schedule", "apply_enabled", True)
+    bot.state.set("schedule", "hours_from", 0)
+    bot.state.set("schedule", "hours_to", 0)
+    (bot.config_path / "captcha.png").write_bytes(b"PNG")
+    (bot.config_path / "captcha_pending.json").write_text('{"key": "k"}', encoding="utf-8")
+    (bot.runner.logs_dir / "apply.log").write_text("⏸ hh запросил капчу\n", encoding="utf-8")
+    task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies"])
+    task.proc.alive = False
+
+    bot._on_task_finish(task, 3)
+
+    chat, photo, caption = bot.api.photos[-1]
+    assert chat == OWNER and photo.name == "captcha.png" and "просит капчу" in caption
+    assert "введите капчу — продолжу сразу" in bot.api.sent[-1][1]
+
+    calls = []
+    bot.runner.run_sync = lambda args, timeout=90: calls.append(args) or (0, "ok", "")
+    bot._background = lambda fn: fn()
+    bot.handle_update(message("хатку кропил"))
+    assert calls[-1] == ["captcha", "--answer=хатку кропил"]
+    assert bot.runner.started[-1][0] == "apply"
+    assert "Капча принята" in bot.api.sent[-1][1]
+
+
+def test_wrong_captcha_answer_sends_new_image(bot):
+    (bot.config_path / "captcha.png").write_bytes(b"PNG")
+    (bot.config_path / "captcha_pending.json").write_text('{"key": "k"}', encoding="utf-8")
+    bot.runner.run_sync = lambda args, timeout=90: (4, "", "")
+    bot._background = lambda fn: fn()
+    bot.handle_update(message("неверно"))
+    assert "Неверно" in bot.api.photos[-1][2]
+    assert bot.pending_input[OWNER] == "captcha"
+
+
+def test_stop_words_are_literal(bot, tmp_path):
+    import re as _re
+
+    from hh_applicant_tool.tgbot.bot import normalize_keywords
+
+    assert normalize_keywords("junior|C++|c#|.net") == r"junior|C\+\+|c\#|\.net"
+    # Регулярные выражения и повторная нормализация не меняются
+    assert normalize_keywords(r"ai[- ]?engineer|C\+\+") == r"ai[- ]?engineer|C\+\+"
+    args = build_apply_args({"excluded_filter": "junior|C++"}, tmp_path / "letter.txt")
+    pattern = [a for a in args if a.startswith("--excluded-filter=")][0].split("=", 1)[1]
+    assert not _re.search(pattern, "LLM-инженер Lexica", _re.I)
+    assert _re.search(pattern, "C++ developer", _re.I)
+
+
+
+def write_sent(bot, times):
+    bot.sent_times_path.write_text("".join(f"{t:.0f}\n" for t in times), encoding="utf-8")
+
+
+def test_quota_is_rolling_24h_by_each_response(bot):
+    now = time.time()
+    # 30 часов назад — уже не считается; 20 часов назад и час назад — считаются
+    write_sent(bot, [now - 30 * 3600] * 5 + [now - 20 * 3600] * 150 + [now - 3600] * 30)
+    assert bot.applied_24h(now) == 180
+    assert bot.apply_quota_left(now) == 20
+    assert "Откликов за 24 часа: <b>180</b> из 200" in bot.render("main")[0]
+
+
+def test_apply_run_is_capped_by_free_quota(bot):
+    write_sent(bot, [time.time() - 3600] * 150)
+    bot.handle_update(callback("run:apply"))
+    args = bot.runner.started[-1][1]
+    assert _max_responses(args) == 50
+    assert args.count("--max-responses") == 1
+
+
+def test_own_run_limit_is_kept_when_smaller_than_quota(bot):
+    bot.state.set("apply", "max_responses", 30)
+    bot.start_task("apply")
+    assert _max_responses(bot.runner.started[-1][1]) == 30
+
+
+def test_quota_full_schedules_run_when_slots_free(bot):
+    now = time.time()
+    oldest = now - 20 * 3600
+    write_sent(bot, [oldest + i for i in range(200)])
+    assert bot.start_task("apply") == "Суточный лимит откликов уже набран"
+
+    bot.state.set("schedule", "apply_enabled", True)
+    bot.state.set("schedule", "hours_from", 0)
+    bot.state.set("schedule", "hours_to", 0)
+    bot.state.set("schedule", "update_resumes_enabled", False)
+    bot.tick(now)
+    assert "apply" not in [name for name, _, _ in bot.runner.started]
+    # 20 мест освободятся, когда 20-й по старшинству отклик выйдет из окна
+    expected = oldest + 19 + 24 * 3600 + 60
+    assert bot.state.last_run("apply_next") == pytest.approx(expected, abs=2)
+
+
+def test_hh_limit_message_reschedules_after_free_slots(bot):
+    now = time.time()
+    write_sent(bot, [now - 23 * 3600] * 100 + [now - 60] * 100)
+    bot.state.set("schedule", "apply_enabled", True)
+    (bot.runner.logs_dir / "apply.log").write_text(
+        "📨 Отправили отклик на вакансию https://hh.ru/vacancy/1\n"
+        "⛔ Лимит откликов hh.ru исчерпан. Попробуйте позже.\n",
+        encoding="utf-8",
+    )
+    task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies"])
+    task.proc.alive = False
+    bot._on_task_finish(task, 0)
+    resume_at = bot.state.last_run("apply_next")
+    assert now + 3600 - 5 <= resume_at <= now + 3600 + 120
+    assert "200 откликов за 24 часа" in bot.api.sent[-1][1]
+
+
+def test_apply_finish_reports_sent_count(bot):
+    log = "🚀 Начинаю\n" + "📨 Отправили отклик на вакансию https://hh.ru/vacancy/1\n" * 7
+    (bot.runner.logs_dir / "apply.log").write_text(log, encoding="utf-8")
+    task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies"])
+    task.proc.alive = False
+    bot._on_task_finish(task, 0)
+    assert "Отправлено откликов: <b>7</b>" in bot.api.sent[-1][1]
+
+
+def test_failed_apply_run_is_retried_while_quota_left(bot):
+    bot.state.set("schedule", "apply_enabled", True)
+    bot.state.set("schedule", "hours_from", 0)
+    bot.state.set("schedule", "hours_to", 0)
+    write_sent(bot, [time.time() - 60] * 44)
+    (bot.runner.logs_dir / "apply.log").write_text("[E] 403 Client Error\n", encoding="utf-8")
+    task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies"])
+    task.proc.alive = False
+    before = time.time()
+    bot._on_task_finish(task, 1)
+    assert bot.state.last_run("apply_next") == pytest.approx(before + 1800, abs=5)
+    assert "повторю через 30 мин" in bot.api.sent[-1][1]
+    assert "Осталось 156 откликов из лимита" in bot.api.sent[-1][1]
+
+
+def test_captcha_pause_retries_in_an_hour(bot):
+    bot.state.set("schedule", "apply_enabled", True)
+    bot.state.set("schedule", "hours_from", 0)
+    bot.state.set("schedule", "hours_to", 0)
+    (bot.runner.logs_dir / "apply.log").write_text(
+        "📨 Отправили отклик на вакансию https://hh.ru/vacancy/1\n"
+        "⏸ hh запросил капчу — ставлю отклики на паузу\n",
+        encoding="utf-8",
+    )
+    task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies"])
+    task.proc.alive = False
+    before = time.time()
+    bot._on_task_finish(task, 3)
+    assert bot.state.last_run("apply_next") == pytest.approx(before + 3600, abs=5)
+    text = bot.api.sent[-1][1]
+    assert "пауза — hh попросил капчу" in text
+    assert "Отправлено откликов: <b>1</b>" in text
+
+
+def test_dry_run_is_limited_and_ignores_quota(bot):
+    bot.state.set("apply", "dry_run", True)
+    write_sent(bot, [time.time() - 60] * 200)
+    assert bot.start_task("apply") == "Запущено"
+    args = bot.runner.started[-1][1]
+    assert _max_responses(args) == 5 and "--dry-run" in args
+
+
+def test_sent_times_are_pruned_by_daily_cleanup(bot):
+    now = time.time()
+    write_sent(bot, [now - 50 * 3600, now - 60])
+    bot.cleanup_storage()
+    assert bot.sent_times_path.read_text(encoding="utf-8").split() == [f"{now - 60:.0f}"]
+
+
+def test_run_that_used_its_share_continues_when_slots_free(bot):
+    now = time.time()
+    write_sent(bot, [now - 23.9 * 3600] * 50 + [now - 60] * 150)
+    bot.state.set("schedule", "apply_enabled", True)
+    (bot.runner.logs_dir / "apply.log").write_text(
+        "📨 Отправили отклик на вакансию https://hh.ru/vacancy/1\n" * 20, encoding="utf-8"
+    )
+    task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies", "--max-responses", "20"])
+    task.proc.alive = False
+    bot._on_task_finish(task, 0)
+    resume_at = bot.state.last_run("apply_next")
+    # старые 50 выйдут из окна через ~6 минут, но не раньше 10-минутной паузы
+    assert now + 600 - 5 <= resume_at <= now + 700
+    assert "Продолжу" in bot.api.sent[-1][1]
+
+
+def test_new_login_resets_quota(bot):
+    write_sent(bot, [time.time() - 60] * 195)
+    bot.api.files["f9"] = json.dumps(
+        {"token": {"access_token": "new", "refresh_token": "other-account"}}
+    ).encode()
+    bot.handle_document(OWNER, {"file_id": "f9", "file_name": "config.json"})
+    assert bot.applied_24h() == 0
+    assert bot.apply_quota_left() == 200
+    assert list(bot.config_path.glob("sent_times.*.txt"))
+
+    # Повторная загрузка того же токена квоту не сбрасывает
+    write_sent(bot, [time.time() - 60] * 10)
+    bot.handle_document(OWNER, {"file_id": "f9", "file_name": "config.json"})
+    assert bot.applied_24h() == 10
+
+
+def test_priority_settings_go_to_apply_args(bot, tmp_path):
+    from hh_applicant_tool.main import HHApplicantTool
+
+    bot.handle_update(callback("cycle:priority_area"))
+    assert bot.state.get("apply", "priority_area") == "16"
+    args = build_apply_args(bot.state.get("apply"), tmp_path / "letter.txt")
+    ns = HHApplicantTool()._parser.parse_args(args)
+    assert ns.recommended_first and ns.priority_area == ["16"]
+    assert "Беларусь" in bot.render("settings")[0]
+
+
+def test_each_task_gets_own_log_file(tmp_path):
+    from hh_applicant_tool.tgbot.runner import TaskRunner
+
+    runner = TaskRunner(tmp_path, lambda task, code: None)
+    assert runner._env("apply")["HH_LOG_FILE"] == "log_apply.txt"
+    assert runner._env()["HH_LOG_FILE"] == "log_cli.txt"
+
+
+def test_tool_log_file_follows_env(tmp_path, monkeypatch):
+    from hh_applicant_tool.main import HHApplicantTool
+
+    tool = HHApplicantTool()
+    tool.config_dir = tmp_path
+    tool.profile_id = None
+    monkeypatch.setenv("HH_LOG_FILE", "log_apply.txt")
+    assert tool.log_file == tmp_path.resolve() / "log_apply.txt"
+
+
+
+INTERVIEW_BLOCK = (
+    "🎯 Собеседование (приглашение): «AI Engineer» — hoster.by\n"
+    "https://hh.ru/vacancy/1\n"
+    "Работодатель (Анна): Удобно созвониться завтра в 15:00?\n"
+    "Чат: 5666562040\n=== конец ===\n"
+)
+
+
+def test_only_interview_events_are_forwarded_once(bot):
+    log = bot.runner.logs_dir / "autoresponder.log"
+    log.write_text("старое\n", encoding="utf-8")
+    bot.forward_chat_events()
+    with log.open("a", encoding="utf-8") as fp:
+        fp.write(
+            "🙋 Нужно ваше решение: «ML» — ТГТ\nОтвет: Обсудим в Telegram\n=== конец ===\n"
+            "💬 Ответил в чате: «ML» — ТГТ\nОтвет: Хорошо\n=== конец ===\n"
+            + INTERVIEW_BLOCK
+        )
+    bot.forward_chat_events()
+    bot.forward_chat_events()
+    texts = [t for _, t, _ in bot.api.sent]
+    assert len(texts) == 1
+    assert texts[0].startswith("<b>🎯 Собеседование (приглашение)")
+    assert "Удобно созвониться" in texts[0] and "Чат:" not in texts[0]
+
+
+def test_owner_can_reply_to_interview_from_telegram(bot):
     log = bot.runner.logs_dir / "autoresponder.log"
     log.write_text("", encoding="utf-8")
     bot.forward_chat_events()
     with log.open("a", encoding="utf-8") as fp:
-        fp.write(
-            "🙋 Нужно ваше решение: «AI-разработчик» — Инфогород\n"
-            "https://hh.ru/vacancy/1\n"
-            "Работодатель (Робот-рекрутер): Готовы ли к офисному формату?\n"
-            "Ответ: не отправлен — выберите вариант\n"
-            "Чат: 5666562040\nКнопки: да | нет\n=== конец ===\n"
-        )
+        fp.write(INTERVIEW_BLOCK)
     bot.forward_chat_events()
-    _, text, markup = bot.api.sent[-1]
-    assert "Чат:" not in text and "Робот ждёт ответа кнопкой" in text
-    buttons = markup["inline_keyboard"]
-    assert [b["callback_data"] for b in buttons[0]] == ["ans:5666562040:0", "ans:5666562040:1"]
+    markup = bot.api.sent[-1][2]
+    assert markup["inline_keyboard"][-1][0]["callback_data"] == "ansin:5666562040"
 
-    bot.runner.sync_result = (0, "Отправлено", "")
     calls = []
     bot.runner.run_sync = lambda args, timeout=90: calls.append(args) or (0, "ok", "")
-    bot._background = lambda fn: fn()
-    bot.handle_update(callback("ans:5666562040:1"))
-    assert calls[-1] == ["autoresponder", "--send-chat", "5666562040", "--text=нет"]
-    assert "Отправлено в чат hh" in bot.api.sent[-1][1]
-
-    # Свой ответ текстом
     bot.handle_update(callback("ansin:5666562040"))
-    bot.handle_update(message("Готов обсудить гибрид"))
-    assert calls[-1][-1] == "--text=Готов обсудить гибрид"
+    bot.handle_update(message("Да, завтра в 15:00 удобно"))
+    assert calls[-1] == ["autoresponder", "--send-chat", "5666562040", "--text=Да, завтра в 15:00 удобно"]
+
+
+def test_run_without_more_vacancies_sleeps_until_next_day(bot):
+    write_sent(bot, [time.time() - 60] * 30)
+    log = "📨 Отправили отклик на вакансию https://hh.ru/vacancy/1\n" * 3
+    (bot.runner.logs_dir / "apply.log").write_text(log, encoding="utf-8")
+    # Прогону дали 170 мест, отправил 3 — вакансии кончились, лимит ни при чём
+    task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies", "--max-responses", "170"])
+    task.proc.alive = False
+    bot.state.mark_run("apply_next", 0)
+    bot._on_task_finish(task, 0)
+    assert bot.state.last_run("apply_next") > time.time() + 6 * 3600
+    assert "💤 Подходящих вакансий больше нет" in bot.api.sent[-1][1]

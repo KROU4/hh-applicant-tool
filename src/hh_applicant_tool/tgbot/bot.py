@@ -11,7 +11,7 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, tzinfo
+from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -20,6 +20,7 @@ import requests
 
 from ..constants import CONFIG_FILENAME, DATABASE_FILENAME, LOG_FILENAME
 from ..utils.config import Config
+from ..utils import hhcaptcha
 from ..utils.string import rand_text, render_template
 from .runner import Task, TaskRunner
 from .state import BotState
@@ -39,6 +40,11 @@ TASK_TITLES = {
 AI_FILTERS = [None, "light", "heavy"]
 AI_FILTER_TITLES = {None: "выкл", "light": "быстрый", "heavy": "полный"}
 WORK_FORMATS = [None, "REMOTE", "HYBRID", "REMOTE,HYBRID"]
+# Регион, вакансии из которого идут первыми (area id hh)
+PRIORITY_AREAS = [None, "16", "113", "40"]
+PRIORITY_AREA_TITLES = {None: "нет", "16": "Беларусь", "113": "Россия", "40": "Казахстан"}
+OTHER_AREAS = ["remote", "none", "all"]
+OTHER_AREAS_TITLES = {"remote": "только удалёнка", "none": "не искать", "all": "все вакансии"}
 WORK_FORMAT_TITLES = {
     None: "любой",
     "REMOTE": "удалёнка",
@@ -55,7 +61,16 @@ EXPERIENCE_TITLES = {
 }
 APPLY_INTERVALS = [24, 12, 8, 6, 4]
 # Скользящее окно суточной квоты откликов
+# Сколько хранить журнал отправленных откликов
+# hh считает лимит откликов за скользящие 24 часа
 QUOTA_WINDOW = 24 * 3600
+SENT_TIMES_FILENAME = "sent_times.txt"
+# После исчерпания лимита ждём, пока освободится хотя бы столько мест
+MIN_FREE_SLOTS = 20
+# Пауза перед добором лимита после прогона, выбравшего свою порцию
+CAP_RETRY_DELAY = 10 * 60
+# hh сказал «лимит исчерпан», а наш подсчёт расходится — не чаще раза в час
+HH_LIMIT_RETRY = 3600
 NEGOTIATION_STATES = {
     "response": "📨 отправлено",
     "invitation": "🎉 приглашения",
@@ -68,9 +83,19 @@ NEGOTIATION_STATES = {
 UPDATE_RESUMES_EVERY = 4 * 3600
 # Через сколько повторить оборвавшийся прогон откликов
 APPLY_RETRY_DELAY = 30 * 60
+# После капчи hh ждём дольше
+CAPTCHA_RETRY_DELAY = 60 * 60
+# apply-vacancies завершается с этим кодом, если hh попросил капчу
+CAPTCHA_EXIT_CODE = 3
+# hh-applicant-tool captcha --answer: неверный ответ, новая картинка готова
+CAPTCHA_WRONG_EXIT_CODE = 4
 AUTORESPONDER_RESTART_EVERY = 6 * 3600
 AUTORESPONDER_BACKOFF = 10 * 60
 REFRESH_TOKEN_EVERY = 20 * 3600
+# Ежедневная чистка базы: сохранённые вакансии и отметки о пропуске
+CLEANUP_EVERY = 24 * 3600
+VACANCY_KEEP_DAYS = 7
+SKIPPED_KEEP_DAYS = 30
 SCHEDULER_TICK = 20
 
 SUMMARY_MARKERS = (
@@ -103,12 +128,13 @@ SUCCESS_CODES = {"refresh_token": (0, 2)}
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 APPLIED_RE = re.compile(r"Отправлено:\s*(\d+)")
 SENT_RE = re.compile(r"^📨 Отправили отклик", re.M)
+HH_LIMIT_MARKER = "Лимит откликов hh.ru исчерпан"
 # Блоки тестовых откликов из вывода apply-vacancies --dry-run
 DRY_RUN_RE = re.compile(r"(🧪 Тест: .*?)\n=== конец ===", re.S)
 DRY_RUN_LIMIT = 5
 # События автоответчика (ответил / нужен человек) из его вывода
 CHAT_EVENT_END = "=== конец ===".encode()
-CHAT_EVENT_RE = re.compile(r"((?:🙋|💬)[^\n]*\n.*?)\n=== конец ===", re.S)
+CHAT_EVENT_RE = re.compile(r"((?:🙋|💬|🎯)[^\n]*\n.*?)\n=== конец ===", re.S)
 
 WELCOME_IMAGE = "welcome.jpg"
 WELCOME_TEXT = (
@@ -120,7 +146,13 @@ WELCOME_TEXT = (
     "Всё управление — кнопками ниже 👇"
 )
 
+ANSWERS_FILENAME = "candidate_answers.txt"
+
 INPUT_PROMPTS = {
+    "answers_add": "➕ Пришлите правило одной строкой, например:\n"
+    "<code>Переработки: готов при необходимости</code>\n"
+    "<code>Судимость: нет</code>",
+    "answers_set": "✏️ Пришлите весь список правил целиком (каждое с новой строки). «-» — очистить.",
     "search": "🔍 Пришлите поисковый запрос (например: <code>python разработчик</code>).\nПустой поиск = рекомендованные вакансии. «-» — очистить.",
     "included_filter": "🎯 Пришлите ключевые слова через | (регулярное выражение), например:\n"
     "<code>llm|rag|genai|ai[- ]?engineer|ai-инженер|агент</code>\n"
@@ -134,7 +166,7 @@ INPUT_PROMPTS = {
     "Случайный вариант: {Здравствуйте|Добрый день}.",
     "letter_contact": "📨 Пришлите контакт, который бот добавит в конец каждого AI-письма (например, <code>https://t.me/username</code>). «-» — не добавлять.",
     "hours": "🕘 Пришлите часы работы автооткликов в формате <code>9-21</code>.",
-    "daily_limit": "🎯 Сколько откликов максимум за 24 часа (включая ручные запуски)? У hh.ru потолок 200. «-» — без лимита.",
+    "daily_limit": "🎯 Сколько откликов максимум за 24 часа (включая ручные запуски)? У hh.ru потолок 200 за скользящие сутки. «-» — без лимита.",
     "openrouter_key": "🔑 Пришлите ключ OpenRouter (sk-or-...).",
 }
 
@@ -197,6 +229,29 @@ def _split_alternatives(pattern: str) -> list[str]:
     return parts
 
 
+def _option_value(args: list[str], option: str) -> int | None:
+    """Числовое значение опции из списка аргументов (--opt N)."""
+    try:
+        return int(args[args.index(option) + 1])
+    except (ValueError, IndexError):
+        return None
+
+
+def normalize_keywords(pattern: str) -> str:
+    """Слова через «|» понимаются буквально: C++, C#, .NET, Node.js.
+
+    В регулярном выражении «C++» значит «сколько угодно букв C» — такой
+    стоп-фильтр отсекал почти все вакансии. Варианты со скобками, «?», «\\»
+    и т.п. остаются регулярными выражениями как есть.
+    """
+    parts = []
+    for alt in _split_alternatives(pattern.strip()):
+        if re.fullmatch(r"[\w\s+#.-]+", alt) and re.search(r"[+#.]", alt):
+            alt = re.escape(alt.strip()).replace("\\ ", " ").replace("\\-", "-")
+        parts.append(alt)
+    return "|".join(parts)
+
+
 def regex_to_query(pattern: str) -> str:
     """Поисковый запрос hh из регулярки: «llm|rag|ai engineer» →
     «llm OR rag OR "ai engineer"». Части с символами регулярок в запрос не
@@ -236,9 +291,13 @@ def build_apply_args(settings: dict[str, Any], letter_path: Path) -> list[str]:
     if search:
         args.append(f"--search={search}")
     if settings.get("included_filter"):
-        args.append(f"--included-filter={settings['included_filter']}")
+        args.append(
+            f"--included-filter={normalize_keywords(settings['included_filter'])}"
+        )
     if settings.get("excluded_filter"):
-        args.append(f"--excluded-filter={settings['excluded_filter']}")
+        args.append(
+            f"--excluded-filter={normalize_keywords(settings['excluded_filter'])}"
+        )
     if settings.get("max_responses"):
         args += ["--max-responses", str(settings["max_responses"])]
     if settings.get("resume_id"):
@@ -253,6 +312,11 @@ def build_apply_args(settings: dict[str, Any], letter_path: Path) -> list[str]:
         args += ["--work-format", *settings["work_format"].split(",")]
     if settings.get("search_in_name"):
         args += ["--search-field", "name"]
+    if settings.get("recommended_first"):
+        args.append("--recommended-first")
+    if settings.get("priority_area"):
+        args += ["--priority-area", str(settings["priority_area"])]
+        args += ["--other-areas", settings.get("other_areas") or "all"]
     return args
 
 
@@ -466,6 +530,13 @@ class HHBot:
             return
 
         key = self.pending_input.pop(chat_id, None)
+        if key == "captcha" or (
+            key is None and hhcaptcha.load_pending(self.config_path)
+        ):
+            # Ответ на капчу hh (в т.ч. если бот перезапускался и забыл, что ждал)
+            answer = text.strip()
+            self._background(lambda: self.answer_captcha(chat_id, answer))
+            return
         if key and key.startswith("reply:"):
             # Свой ответ работодателю в чат hh
             hh_chat_id = key.removeprefix("reply:")
@@ -477,7 +548,7 @@ class HHBot:
             self.api.send_message(chat_id, reply)
             screen = "schedule" if key in ("hours", "daily_limit") else "ai" if key in (
                 "openrouter_key",
-            ) else "settings"
+            ) else "answers" if key.startswith("answers_") else "settings"
             self.send_screen(chat_id, screen)
             return
 
@@ -643,6 +714,9 @@ class HHBot:
             f"🔍 Поиск: {esc(s['search']) or '<i>из ключевых слов</i>' if not s['search'] and s.get('included_filter') else esc(s['search']) or '<i>рекомендованные вакансии</i>'}",
             f"🎯 Ключевые слова (regex): {esc(s.get('included_filter') or '—')}",
             f"🔤 Искать: {'только в названии' if s.get('search_in_name') else 'везде (название и описание)'}",
+            f"⭐ Сначала рекомендации hh: {on_off(s.get('recommended_first'))}",
+            f"🗺 Сначала регион: {PRIORITY_AREA_TITLES.get(s.get('priority_area'), s.get('priority_area'))}",
+            f"🌐 Другие страны: {OTHER_AREAS_TITLES.get(s.get('other_areas') or 'all')}",
             f"   запрос в hh: <code>{esc(s['search'] or regex_to_query(s.get('included_filter') or '') or '—')}</code>",
             f"🚫 Стоп-слова: {esc(s['excluded_filter']) or '—'}",
             f"📄 Резюме: {esc(s['resume_title'] or 'все опубликованные')}",
@@ -677,6 +751,22 @@ class HHBot:
                 button("🔢 Лимит", "input:max_responses"),
             ],
             [
+                button(
+                    f"⭐ Рекомендации {on_off(s.get('recommended_first'))}",
+                    "flip:recommended_first",
+                ),
+                button(
+                    f"🗺 Регион: {PRIORITY_AREA_TITLES.get(s.get('priority_area'), s.get('priority_area'))}",
+                    "cycle:priority_area",
+                ),
+            ],
+            [
+                button(
+                    f"🌐 Другие страны: {OTHER_AREAS_TITLES.get(s.get('other_areas') or 'all')}",
+                    "cycle:other_areas",
+                )
+            ],
+            [
                 button("🌍 Формат", "cycle:work_format"),
                 button("💼 Опыт", "cycle:experience"),
             ],
@@ -702,9 +792,33 @@ class HHBot:
                 button("📨 Контакт в письме", "input:letter_contact"),
                 button("✉️ Шаблон письма", "input:letter"),
             ],
+            [button("📋 Ответы рекрутерам", "screen:answers")],
             [button("◀️ Назад", "screen:main")],
         )
         return "\n".join(lines), markup
+
+    @property
+    def answers_path(self) -> Path:
+        return self.config_path / ANSWERS_FILENAME
+
+    def screen_answers(self) -> tuple[str, dict]:
+        current = (
+            self.answers_path.read_text(encoding="utf-8").strip()
+            if self.answers_path.exists()
+            else ""
+        )
+        text = (
+            "<b>📋 Ответы рекрутерам</b>\n"
+            "Ваши решения по типовым вопросам. Автоответчик отвечает по ним сам — "
+            "текстом или кнопкой «да/нет». Если вопроса здесь нет, он зовёт вас.\n\n"
+            + (f"<pre>{esc(current[:3000])}</pre>" if current else "<i>Пока пусто</i>")
+        )
+        markup = keyboard(
+            [button("➕ Дописать правило", "input:answers_add")],
+            [button("✏️ Заменить всё", "input:answers_set")],
+            [button("◀️ Назад", "screen:settings")],
+        )
+        return text, markup
 
     def screen_schedule(self) -> tuple[str, dict]:
         sch = self.state.get("schedule")
@@ -730,8 +844,8 @@ class HHBot:
             )
             + f", запуск с {sch['hours_from']}:00 до {sch['hours_to']}:00",
             f"   следующий запуск: {when(next_apply) if sch['apply_enabled'] else '—'}",
-            f"🎯 Не больше {sch['daily_limit'] or '∞'} откликов за 24 часа "
-            f"(отправлено: {self.applied_24h()}, осталось: "
+            f"🎯 Не больше {sch['daily_limit'] or '∞'} откликов в сутки "
+            f"(за 24 часа: {self.applied_24h()}, осталось: "
             f"{self.apply_quota_left() if sch['daily_limit'] else '∞'})",
             f"{on_off(sch['update_resumes_enabled'])} Подъём резюме каждые 4ч",
             f"   следующий запуск: {when(next_update) if sch['update_resumes_enabled'] else '—'}",
@@ -774,7 +888,7 @@ class HHBot:
 
     def screen_stats(self) -> tuple[str, dict]:
         lines = ["<b>📊 Статистика</b>", ""]
-        lines.append(f"Откликов за 24 часа (по логам бота): <b>{self.applied_24h()}</b>")
+        lines.append(f"Откликов за 24 часа: <b>{self.applied_24h()}</b>")
         db_path = self.config_path / DATABASE_FILENAME
         if db_path.exists():
             try:
@@ -977,6 +1091,8 @@ class HHBot:
             options = {
                 "ai_filter": AI_FILTERS,
                 "work_format": WORK_FORMATS,
+                "priority_area": PRIORITY_AREAS,
+                "other_areas": OTHER_AREAS,
                 "experience": EXPERIENCES,
             }[arg]
             self.state.set("apply", arg, cycle(options, self.state.get("apply", arg)))
@@ -1010,6 +1126,13 @@ class HHBot:
             self.show(chat_id, message_id, "settings")
         elif action == "log":
             self.send_log(chat_id, arg)
+        elif action == "captcha":
+            if arg == "refresh":
+                self.api.answer_callback(query["id"], "Запрашиваю новую…")
+                self._background(lambda: self.refresh_captcha(chat_id))
+                return
+            self.pending_input.pop(chat_id, None)
+            answer = "Хорошо, попробую позже — капча придёт снова"
         elif action == "ans":
             hh_chat_id, _, index = arg.partition(":")
             options = self.state.get("answers").get(hh_chat_id) or []
@@ -1031,9 +1154,13 @@ class HHBot:
                 "✍️ Напишите ответ работодателю — отправлю его в чат hh как есть.\n/cancel — отмена",
             )
         elif action == "logfile":
+            detailed = self.config_path / f"log_{arg}.txt"
             path = (
                 self.config_path / LOG_FILENAME
                 if arg == "main"
+                # Подробный лог задачи (свой файл у каждой), иначе её вывод
+                else detailed
+                if detailed.exists()
                 else self.runner.logs_dir / f"{arg}.log"
             )
             if path.exists():
@@ -1088,6 +1215,7 @@ class HHBot:
         clear = text in ("-", "—")
         if key in ("search", "excluded_filter", "included_filter", "system_prompt", "letter_contact"):
             if key in ("excluded_filter", "included_filter") and not clear:
+                text = normalize_keywords(text)
                 try:
                     re.compile(text)
                 except re.error as ex:
@@ -1112,6 +1240,20 @@ class HHBot:
                 return f"❌ Ошибка в шаблоне: {esc(ex)}"
             self.letter_path.write_text(template, encoding="utf-8")
             return "✅ Шаблон сохранён"
+        if key in ("answers_add", "answers_set"):
+            current = (
+                self.answers_path.read_text(encoding="utf-8").strip()
+                if self.answers_path.exists()
+                else ""
+            )
+            if clear:
+                self.answers_path.unlink(missing_ok=True)
+                return "✅ Ответы очищены"
+            rule = text.strip()
+            if key == "answers_add" and current:
+                rule = f"{current}\n{rule}"
+            self.answers_path.write_text(rule + "\n", encoding="utf-8")
+            return "✅ Сохранено — автоответчик учтёт при следующей проверке чатов"
         if key == "daily_limit":
             if clear:
                 self.state.set("schedule", key, 0)
@@ -1119,7 +1261,7 @@ class HHBot:
             if not text.isdigit() or int(text) <= 0:
                 return "❌ Нужно положительное число"
             self.state.set("schedule", key, int(text))
-            return f"✅ Не больше {text} откликов за 24 часа"
+            return f"✅ Не больше {text} откликов в сутки"
         if key == "hours":
             match = re.fullmatch(r"\s*(\d{1,2})\s*[-–]\s*(\d{1,2})\s*", text)
             if not match or int(match[1]) > 23 or int(match[2]) > 24:
@@ -1153,11 +1295,15 @@ class HHBot:
             for key in SERVER_CONFIG_KEYS:
                 if key in cfg:
                     uploaded.pop(key, None)
+            old_refresh = (cfg.get("token") or {}).get("refresh_token")
             cfg.save(uploaded)
             # Автоответчик держит старый токен в памяти и при выходе записал бы
             # его обратно — перезапускаем, планировщик поднимет его снова
             self.runner.stop("autoresponder")
             has_token = bool((uploaded.get("token") or {}).get("access_token"))
+            new_refresh = (uploaded.get("token") or {}).get("refresh_token")
+            if has_token and new_refresh != old_refresh:
+                self.reset_quota_for_new_login()
             self.api.send_message(
                 chat_id,
                 "✅ config.json загружен"
@@ -1281,8 +1427,6 @@ class HHBot:
                 len(SENT_RE.findall(log)),
                 sum(int(n) for n in APPLIED_RE.findall(log)),
             )
-            if "--dry-run" not in task.args:
-                self._record_applied(applied)
         if task.name == "autoresponder":
             if task.elapsed < 120 and not task.stopped_by_user:
                 self.state.mark_run(
@@ -1297,8 +1441,11 @@ class HHBot:
 
         summary = summarize_log(log)
         auth_problem = code != 0 and any(m in log for m in AUTH_MARKERS)
+        captcha = task.name == "apply" and code == CAPTCHA_EXIT_CODE
         if task.stopped_by_user:
             head = f"⏹ {task.title}: остановлено"
+        elif captcha:
+            head = f"⏸ {task.title}: пауза — hh попросил капчу"
         elif code == 0:
             head = f"✅ {task.title}: готово за {fmt_duration(task.elapsed)}"
         else:
@@ -1310,6 +1457,54 @@ class HHBot:
         dry_run = task.name == "apply" and "--dry-run" in task.args
         if dry_run and not task.stopped_by_user:
             self._send_dry_run_report(log)
+        limit_note = ""
+        # Прогон упёрся в выданную ему порцию лимита, а вакансии ещё есть:
+        # за время прогона освобождаются новые места — добираем их
+        cap = _option_value(task.args, "--max-responses")
+        cap_reached = cap is not None and applied >= cap
+        if (
+            task.name == "apply"
+            and not dry_run
+            and not captcha
+            and not task.stopped_by_user
+            and (
+                HH_LIMIT_MARKER in log
+                or self.apply_quota_left() == 0
+                or cap_reached
+            )
+        ):
+            # Лимит 200 за 24 часа занят: продолжаем, когда освободятся места
+            resume_at = max(
+                self.quota_free_at(MIN_FREE_SLOTS), time.time() + CAP_RETRY_DELAY
+            )
+            if HH_LIMIT_MARKER in log:
+                resume_at = max(resume_at, time.time() + HH_LIMIT_RETRY)
+            self.state.mark_run("apply_next", resume_at)
+            limit_note = (
+                "\n\n⏳ Лимит hh — 200 откликов за 24 часа. Продолжу "
+                + datetime.fromtimestamp(resume_at, self.tz).strftime("%d.%m в %H:%M")
+                + ", когда освободятся места."
+            )
+        elif (
+            task.name == "apply"
+            and code == 0
+            and not dry_run
+            and not task.stopped_by_user
+        ):
+            # Лимит не упёрся — значит, подходящие вакансии кончились. Не
+            # перебираем их заново, а спим до следующей суточной проверки
+            every = self.state.get("schedule", "apply_every_hours") * 3600
+            resume_at = max(
+                self.state.last_run("apply_next"),
+                self.next_apply_time(time.time(), every),
+            )
+            self.state.mark_run("apply_next", resume_at)
+            limit_note = (
+                "\n\n💤 Подходящих вакансий больше нет — жду новых. Следующая "
+                "проверка "
+                + datetime.fromtimestamp(resume_at, self.tz).strftime("%d.%m в %H:%M")
+                + "."
+            )
         retry_note = ""
         if (
             task.name == "apply"
@@ -1319,25 +1514,100 @@ class HHBot:
             and self.state.get("schedule", "apply_enabled")
             and self.apply_quota_left() > 0
         ):
-            # Прогон оборвался — добираем суточную квоту, а не ждём сутки
-            self.state.mark_run("apply_next", time.time() + APPLY_RETRY_DELAY)
+            # Прогон оборвался — добираем суточную квоту, а не ждём сутки.
+            # После капчи ждём дольше: hh снимает её со временем
+            delay = CAPTCHA_RETRY_DELAY if captcha else APPLY_RETRY_DELAY
+            retry_at = time.time() + delay
+            self.state.mark_run("apply_next", retry_at)
+            sch = self.state.get("schedule")
+            if in_hours(
+                datetime.fromtimestamp(retry_at, self.tz).hour,
+                sch["hours_from"],
+                sch["hours_to"],
+            ):
+                when = (
+                    "введите капчу — продолжу сразу, иначе повторю через "
+                    f"{delay // 60} мин."
+                    if captcha
+                    else f"повторю через {delay // 60} мин."
+                )
+            else:
+                when = f"продолжу завтра с {sch['hours_from']}:00."
             retry_note = (
-                f"\n\n🔁 Осталось {self.apply_quota_left()} откликов на сегодня — "
-                f"повторю через {APPLY_RETRY_DELAY // 60} мин."
+                f"\n\n🔁 Осталось {self.apply_quota_left()} откликов из лимита — {when}"
             )
         text = f"<b>{esc(head)}</b>"
-        if task.name == "apply" and code == 0 and not dry_run:
+        if task.name == "apply" and (code == 0 or captcha) and not dry_run:
             text += f"\nОтправлено откликов: <b>{applied}</b>"
         if summary:
             text += f"\n<pre>{esc(summary[-3000:])}</pre>"
         if auth_problem:
             text += "\n\n🔑 Похоже, слетела авторизация — загляните в 👤 Аккаунт."
-        text += retry_note
+        text += retry_note + limit_note
         self.notify(
             text,
             silent=task.scheduled and code == 0,
             markup=keyboard([button("📜 Полный лог", f"log:{task.name}"), button("🏠 Меню", "screen:main")]),
         )
+        if captcha:
+            self.ask_captcha()
+
+    # ---------------------------------------------------------------- captcha
+
+    def ask_captcha(self, chat_id: int | None = None, caption: str = "") -> bool:
+        """Картинка капчи hh владельцу; ответ он присылает текстом."""
+        owner = chat_id or self.state.owner_id
+        image = hhcaptcha.image_path(self.config_path)
+        if not owner or not image.exists():
+            return False
+        self.pending_input[owner] = "captcha"
+        self.api.send_photo(
+            owner,
+            image,
+            caption
+            or "🔐 <b>hh.ru просит капчу</b>\nПришлите текст с картинки одним сообщением — "
+            "отправлю его в hh и продолжу отклики.",
+            reply_markup=keyboard(
+                [
+                    button("🔄 Другая картинка", "captcha:refresh"),
+                    button("⏭ Позже", "captcha:later"),
+                ]
+            ),
+        )
+        return True
+
+    def answer_captcha(self, chat_id: int, answer: str) -> None:
+        if not answer:
+            self.ask_captcha(chat_id, "Пустой ответ. Пришлите текст с картинки:")
+            return
+        self.api.send_message(chat_id, "⏳ Проверяю…")
+        code, out, err = self.runner.run_sync(["captcha", f"--answer={answer}"])
+        logger.info("Ответ на капчу из Telegram: код %s", code)
+        if code == 0:
+            started = self.start_task("apply")
+            self.api.send_message(
+                chat_id,
+                "✅ Капча принята. "
+                + (
+                    "Продолжаю отклики."
+                    if started == "Запущено"
+                    else f"Отклики: {started.lower()}."
+                ),
+            )
+        elif code == CAPTCHA_WRONG_EXIT_CODE:
+            self.ask_captcha(chat_id, "❌ Неверно. Вот новая картинка — пришлите текст с неё:")
+        else:
+            self.api.send_message(
+                chat_id,
+                "⚠️ Не удалось отправить капчу:\n<pre>"
+                + esc(ANSI_RE.sub("", err or out)[-600:])
+                + "</pre>\nПопробую снова при следующем прогоне.",
+            )
+
+    def refresh_captcha(self, chat_id: int) -> None:
+        code, out, err = self.runner.run_sync(["captcha", "--refresh"])
+        if code != 0 or not self.ask_captcha(chat_id, "🔄 Новая картинка — пришлите текст с неё:"):
+            self.api.send_message(chat_id, "Капча уже не ждёт ответа.")
 
     def _send_dry_run_report(self, log: str) -> None:
         """Каждый тестовый отклик — отдельным сообщением: вакансия и письмо."""
@@ -1354,21 +1624,62 @@ class HHBot:
                 f"<b>{esc(title)}</b>\n{esc(url.strip())}\n\n{esc(letter.strip()[:3500])}"
             )
 
-    def _applied_log(self, now: float) -> list[list[float]]:
-        log = self.state.get("runs").get("applied_log") or []
-        return [r for r in log if r[0] > now - QUOTA_WINDOW]
+    @property
+    def sent_times_path(self) -> Path:
+        return self.config_path / SENT_TIMES_FILENAME
+
+    def sent_times(self, now: float | None = None) -> list[float]:
+        """Время откликов за последние 24 часа, по возрастанию.
+
+        hh считает лимит 200 за скользящие 24 часа по каждому отклику,
+        поэтому apply-vacancies пишет время каждого отправленного отклика.
+        """
+        now = now or time.time()
+        try:
+            lines = self.sent_times_path.read_text(encoding="utf-8").split()
+        except OSError:
+            return []
+        times = []
+        for line in lines:
+            try:
+                ts = float(line)
+            except ValueError:
+                continue
+            if ts > now - QUOTA_WINDOW:
+                times.append(ts)
+        return sorted(times)
+
+    def reset_quota_for_new_login(self) -> None:
+        """Новый вход (возможно, другой аккаунт hh) — свой лимит 200 за сутки.
+
+        Старый журнал откладываем, а не удаляем: если это повторный вход в
+        тот же аккаунт, лимит hh всё равно не даст отправить лишнее.
+        """
+        if self.sent_times_path.exists():
+            self.sent_times_path.replace(
+                self.sent_times_path.with_name(f"sent_times.{int(time.time())}.txt")
+            )
+        self.state.mark_run("apply_next", 0)
+        logger.info("Новый вход в hh: счётчик лимита откликов начат заново")
 
     def applied_24h(self, now: float | None = None) -> int:
-        now = now or time.time()
-        return int(sum(count for _, count in self._applied_log(now)))
+        return len(self.sent_times(now))
 
-    def _record_applied(self, count: int) -> None:
-        if not count:
-            return
-        now = time.time()
-        self.state.set(
-            "runs", "applied_log", self._applied_log(now) + [[now, count]]
-        )
+    def quota_free_at(self, slots: int, now: float | None = None) -> float:
+        """Когда освободится `slots` мест в лимите (по старым откликам)."""
+        now = now or time.time()
+        limit = int(self.state.get("schedule", "daily_limit") or 0)
+        times = self.sent_times(now)
+        need = len(times) - (limit - slots) if limit else 0
+        if need <= 0:
+            return now
+        return times[min(need, len(times)) - 1] + QUOTA_WINDOW + 60
+
+    def _prune_sent_times(self, now: float) -> None:
+        keep = [ts for ts in self.sent_times(now)]
+        tmp = self.sent_times_path.with_suffix(".tmp")
+        tmp.write_text("".join(f"{ts:.0f}\n" for ts in keep), encoding="utf-8")
+        tmp.replace(self.sent_times_path)
 
     # ------------------------------------------------------------- scheduler
 
@@ -1408,8 +1719,9 @@ class HHBot:
         text = ANSI_RE.sub("", complete.decode("utf-8", "replace"))
         for block in CHAT_EVENT_RE.findall(text):
             head, _, body = block.partition("\n")
-            # Обычные ответы видны в 📜 Логи; уведомляем только когда нужен владелец
-            if not head.startswith("🙋"):
+            # В Telegram — только то, что предвещает собеседование или оффер;
+            # ответы автоответчика и его вопросы видны в 📜 Логи
+            if not head.startswith("🎯"):
                 continue
             fields = dict(
                 line.split(": ", 1)
@@ -1433,9 +1745,8 @@ class HHBot:
                     [button("✍️ Ответить самому", f"ansin:{chat_id}")],
                 ]
             hint = (
-                "\n\n👉 Робот ждёт ответа кнопкой — выберите вариант, бот отправит его в чат."
-                if options
-                else "\n\n👉 Бот перевёл разговор в Telegram. Можно ответить в чат hh прямо отсюда."
+                "\n\n👉 Похоже на собеседование. Автоответчик продолжает переписку; "
+                "ответить работодателю можно и отсюда."
             )
             self.notify(
                 f"<b>{esc(head)}</b>\n{esc(visible[:3500])}{hint}",
@@ -1451,6 +1762,21 @@ class HHBot:
             self.state.set("answers", hh_chat_id, None)
             return f"✅ Отправлено в чат hh: «{esc(text[:300])}»"
         return "❌ Не удалось отправить:\n<pre>" + esc((err or out)[-800:]) + "</pre>"
+
+    def next_apply_time(self, now: float, every: int) -> float:
+        """Раз в сутки — завтра в начале окна со сдвигом до часа.
+
+        Интервал 24 ч от старта «сползал» к вечеру, и прогон начинался перед
+        самым концом окна. Чаще раза в сутки — через интервал.
+        """
+        if every < 86400:
+            return now + every + random.randint(60, 600)
+        start_hour = self.state.get("schedule", "hours_from")
+        tomorrow = datetime.fromtimestamp(now, self.tz) + timedelta(days=1)
+        run_at = tomorrow.replace(
+            hour=start_hour, minute=0, second=0, microsecond=0
+        )
+        return run_at.timestamp() + random.randint(60, 3600)
 
     def tick(self, now: float | None = None) -> None:
         now = now or time.time()
@@ -1474,14 +1800,14 @@ class HHBot:
         ):
             every = sch["apply_every_hours"] * 3600
             if self.apply_quota_left(now) <= 0:
-                # Квота ещё не освободилась — проверим через час
-                self.state.mark_run("apply_next", now + 3600)
+                # Лимит занят — ждём, пока освободятся места по старым откликам
+                self.state.mark_run(
+                    "apply_next", self.quota_free_at(MIN_FREE_SLOTS, now)
+                )
             else:
                 self.start_task("apply", scheduled=True)
-                # Раз в сутки — со случайным сдвигом до часа (24–25 ч),
-                # чтобы запуски не выглядели как по будильнику
-                jitter = random.randint(60, 3600 if every >= 86400 else 600)
-                self.state.mark_run("apply_next", now + every + jitter)
+                self.state.mark_run("apply_next", self.next_apply_time(now, every))
+
 
         if (
             sch["update_resumes_enabled"]
@@ -1513,3 +1839,43 @@ class HHBot:
             and token.get("refresh_token")
         ):
             self.start_task("refresh_token", scheduled=True)
+
+        if (
+            now - self.state.last_run("cleanup") > CLEANUP_EVERY
+            and not self.runner.running("apply")
+        ):
+            self.state.mark_run("cleanup", now)
+            try:
+                self.cleanup_storage()
+            except sqlite3.Error as ex:
+                logger.warning("Не удалось почистить базу: %s", ex)
+
+    def cleanup_storage(self) -> None:
+        """Раз в сутки: старые сохранённые вакансии и отметки о пропуске.
+
+        Контакты работодателей не трогаем — они могут пригодиться.
+        """
+        if self.sent_times_path.exists():
+            self._prune_sent_times(time.time())
+        db_path = self.config_path / DATABASE_FILENAME
+        if not db_path.exists():
+            return
+        con = sqlite3.connect(db_path, timeout=30)
+        try:
+            vacancies = con.execute(
+                "DELETE FROM vacancies WHERE updated_at < datetime('now', ?)",
+                (f"-{VACANCY_KEEP_DAYS} days",),
+            ).rowcount
+            skipped = con.execute(
+                "DELETE FROM skipped_vacancies WHERE created_at < datetime('now', ?)",
+                (f"-{SKIPPED_KEEP_DAYS} days",),
+            ).rowcount
+            con.commit()
+            con.execute("VACUUM")
+        finally:
+            con.close()
+        logger.info(
+            "Чистка базы: удалено вакансий %d, отметок о пропуске %d",
+            vacancies,
+            skipped,
+        )

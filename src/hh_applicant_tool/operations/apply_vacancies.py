@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import html
 import logging
 import random
@@ -23,6 +22,7 @@ from ..api.datatypes import PaginatedItems, SearchVacancy
 from ..api.errors import ApiError, CaptchaRequired, LimitExceeded
 from ..main import BaseNamespace, BaseOperation
 from ..storage.repositories.errors import RepositoryError
+from ..utils import hhcaptcha
 from ..utils.datatypes import VacancyTestsData
 from ..utils.find import find_key
 from ..utils.json import JSONDecoder
@@ -43,6 +43,41 @@ logger = logging.getLogger(__package__)
 
 # Конец блока тестового отклика в выводе --dry-run (его разбирает Telegram-бот)
 DRY_RUN_END = "=== конец ==="
+# Код выхода, если hh попросил капчу: бот повторит прогон позже
+CAPTCHA_EXIT_CODE = 3
+# Сколько полных вакансий держать в памяти (сервер маленький)
+VACANCY_CACHE_SIZE = 50
+
+
+# Время каждого отправленного отклика (для лимита hh за 24 часа)
+SENT_TIMES_FILENAME = "sent_times.txt"
+# Лимит письма в форме отклика с тестом (hh отвечает too-long-letter)
+TEST_LETTER_LIMIT = 1500
+
+
+def shorten_letter(letter: str, limit: int) -> str:
+    """Обрезает письмо по границе абзаца или предложения, сохраняя контакт в конце."""
+    if len(letter) <= limit:
+        return letter
+    lines = letter.rstrip().split("\n")
+    tail = lines[-1] if "t.me/" in lines[-1] or "@" in lines[-1] else ""
+    body = "\n".join(lines[:-1]) if tail else letter
+    budget = limit - (len(tail) + 2 if tail else 0)
+    cut = body[:budget]
+    for sep in ("\n\n", ". ", "! ", "? "):
+        pos = cut.rfind(sep)
+        if pos > budget // 2:
+            cut = cut[: pos + 1]
+            break
+    return (cut.rstrip() + ("\n\n" + tail if tail else ""))[:limit]
+
+
+class VacancyCaptcha(Exception):
+    """hh требует капчу — прогон нужно поставить на паузу."""
+
+    def __init__(self, captcha_url: str | None) -> None:
+        super().__init__(f"Captcha required: {captcha_url}")
+        self.captcha_url = captcha_url
 
 DEFAULT_COVER_LETTER_SYSTEM_PROMPT = (
     "Ты пишешь сопроводительные письма на hh.ru от первого лица за кандидата. "
@@ -108,6 +143,9 @@ class Namespace(BaseNamespace):
     total_pages: int
     excluded_filter: str | None
     included_filter: str | None
+    recommended_first: bool
+    priority_area: list[str] | None
+    other_areas: str
     max_responses: int
     send_email: bool
     skip_tests: bool
@@ -120,6 +158,9 @@ class Operation(BaseOperation):
 
     # Сколько откликов отправлено за запуск по всем резюме
     total_applied: int = 0
+    # Пауза между запросами полных вакансий (сек): реже капча hh
+    vacancy_fetch_delay: tuple[float, float] = (3.0, 6.0)
+    captcha_paused: bool = False
     # Контакт в конце AI-письма (например, ссылка на Telegram)
     letter_contact: str = ""
     # Регулярка ключевых слов: без совпадения вакансия пропускается
@@ -212,6 +253,22 @@ class Operation(BaseOperation):
             "--excluded-filter",
             type=str,
             help=r"Исключить вакансии, если название или описание не соответствует шаблону. Например, `--excluded-filter 'junior|стажир|bitrix|дружн\w+ коллектив|полиграф|open\s*space|опенспейс|хакатон|конкурс|тестов\w+ задан'`",
+        )
+        parser.add_argument(
+            "--recommended-first",
+            action="store_true",
+            help="Сначала откликаться на рекомендованные hh вакансии для резюме, потом на найденные поиском",
+        )
+        parser.add_argument(
+            "--priority-area",
+            nargs="+",
+            help="Регион (area id), вакансии из которого обрабатываются раньше остальных, например 16 — Беларусь",
+        )
+        parser.add_argument(
+            "--other-areas",
+            choices=["all", "remote", "none"],
+            default="all",
+            help="Вакансии вне --priority-area: все, только удалёнка или никакие",
         )
         parser.add_argument(
             "--included-filter",
@@ -380,6 +437,9 @@ class Operation(BaseOperation):
         self.excluded_employer_id = args.excluded_employer_id
         self.excluded_filter = args.excluded_filter
         self.included_filter = args.included_filter
+        self.recommended_first = bool(args.recommended_first)
+        self.priority_area = args.priority_area
+        self.other_areas = args.other_areas
         self.experience = args.experience
         self.force_message = args.force_message
         self.industry = args.industry
@@ -418,7 +478,7 @@ class Operation(BaseOperation):
         self.vacancy_filter_ai = None
         self._resume_analysis_cache: dict[tuple[str | None, str], str] = {}
 
-        self._apply_vacancies()
+        return self._apply_vacancies()
 
     def _get_full_resume(self, resume_id: str) -> dict:
         return self.api_client.get(f"/resumes/{resume_id}")
@@ -509,7 +569,7 @@ class Operation(BaseOperation):
         full_vacancy: dict = {}
         if vacancy.get("id"):
             try:
-                full_vacancy = self.api_client.get(f"/vacancies/{vacancy['id']}")
+                full_vacancy = self._full_vacancy(vacancy["id"])
             except ApiError as ex:
                 logger.warning("Не удалось получить вакансию: %s", ex)
         description = strip_tags(
@@ -540,6 +600,13 @@ class Operation(BaseOperation):
             strip_tags(self._analyze_resume_heavy(resume))[:6000]
             or f"Должность: {placeholders['resume_title']}",
         ]
+        answers = self._candidate_answers()
+        if answers:
+            parts += [
+                "",
+                "[РЕШЕНИЯ КАНДИДАТА] (письмо не должно им противоречить)",
+                answers,
+            ]
         if self.letter_contact:
             parts += [
                 "",
@@ -547,6 +614,15 @@ class Operation(BaseOperation):
                 f"для связи: {self.letter_contact}",
             ]
         return "\n".join(parts)
+
+    def _candidate_answers(self) -> str:
+        """Решения соискателя из «📋 Ответы рекрутерам» Telegram-бота."""
+        try:
+            path = self.tool.config_path / "candidate_answers.txt"
+            text = path.read_text(encoding="utf-8")
+        except (OSError, TypeError, AttributeError):
+            return ""
+        return text.strip()[:3000] if isinstance(text, str) else ""
 
     def _finalize_letter(self, letter: str) -> str:
         # hh показывает письмо как обычный текст: markdown остался бы звёздочками
@@ -559,7 +635,7 @@ class Operation(BaseOperation):
 
     def _get_vacancy_key_skills(self, vacancy_id: str | int) -> str:
         try:
-            full_vacancy = self.api_client.get(f"/vacancies/{vacancy_id}")
+            full_vacancy = self._full_vacancy(vacancy_id)
             key_skills_data = full_vacancy.get("key_skills") or []
             return ", ".join(
                 s["name"] for s in key_skills_data if s.get("name")
@@ -687,7 +763,7 @@ class Operation(BaseOperation):
     ) -> bool:
         full_vacancy = None
         if vacancy.get("id"):
-            full_vacancy = self.api_client.get(f"/vacancies/{vacancy['id']}")
+            full_vacancy = self._full_vacancy(vacancy["id"])
 
         vacancy_info = self._build_vacancy_context(
             vacancy,
@@ -759,60 +835,7 @@ class Operation(BaseOperation):
 {resume_analysis}
 """
 
-    SEL_CAPTCHA_IMAGE = 'img[data-qa="account-captcha-picture"]'
-    SEL_CAPTCHA_INPUT = 'input[data-qa="account-captcha-input"]'
-
-    # Даже куки не грузятся, исправь
-    async def _solve_captcha_async(self, captcha_url: str) -> bool:
-        from playwright.async_api import async_playwright
-
-        captcha_ai = self.tool.get_captcha_ai()
-
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
-            try:
-                context = await browser.new_context()
-                page = await context.new_page()
-
-                await page.goto(captcha_url, timeout=30000)
-
-                captcha_element = await page.wait_for_selector(
-                    self.SEL_CAPTCHA_IMAGE, timeout=10000, state="visible"
-                )
-
-                img_bytes = await captcha_element.screenshot()
-
-                captcha_text = await asyncio.to_thread(
-                    captcha_ai.solve_captcha, img_bytes
-                )
-
-                if not captcha_text:
-                    logger.error("AI не смог распознать капчу")
-                    return False
-
-                logger.info(f"Распознанный текст капчи: {captcha_text}")
-
-                await page.fill(self.SEL_CAPTCHA_INPUT, captcha_text)
-                await page.press(self.SEL_CAPTCHA_INPUT, "Enter")
-
-                await page.wait_for_load_state("networkidle", timeout=15000)
-
-                cookies = await context.cookies()
-                for c in cookies:
-                    self.tool.session.cookies.set(
-                        c["name"],
-                        c["value"],
-                        domain=c.get("domain", ""),
-                        path=c.get("path", "/"),
-                    )
-
-                return True
-            finally:
-                await browser.close()
-
-        return False
-
-    def _apply_vacancies(self) -> None:
+    def _apply_vacancies(self) -> int | None:
         resumes: list[datatypes.Resume] = self.tool.get_resumes()
         try:
             self.tool.storage.resumes.save_batch(resumes)
@@ -848,6 +871,8 @@ class Operation(BaseOperation):
                 break
             if self.max_responses and self.total_applied >= self.max_responses:
                 break
+            if self.captcha_paused:
+                break
 
         # Синхронизация откликов
         # for neg in self.tool.get_negotiations():
@@ -857,6 +882,9 @@ class Operation(BaseOperation):
         #         logger.warning(e)
 
         print("📝 Отклики на вакансии разосланы!")
+        if self.captcha_paused:
+            return CAPTCHA_EXIT_CODE
+        return None
 
     def _apply_resume(
         self,
@@ -934,6 +962,8 @@ class Operation(BaseOperation):
                 self.vacancy_filter_ai.rate_limit = self.args.ai_rate_limit
 
         for vacancy in self._get_vacancies(resume_id=resume["id"]):
+            # С предыдущей вакансией закончили — её данные больше не нужны
+            self._forget_vacancies()
             if (
                 getattr(self, "_cancel_event", None)
                 and self._cancel_event.is_set()
@@ -1189,9 +1219,21 @@ class Operation(BaseOperation):
                                 resume_hash=resume["id"],
                                 letter=letter,
                             )
+                            if (
+                                isinstance(result, dict)
+                                and result.get("error") == "too-long-letter"
+                            ):
+                                # В форме с тестом у письма свой, меньший лимит
+                                letter = shorten_letter(letter, TEST_LETTER_LIMIT)
+                                result = self._solve_vacancy_test(
+                                    vacancy_id=vacancy["id"],
+                                    resume_hash=resume["id"],
+                                    letter=letter,
+                                )
                             test_handled = True
                             if result.get("success") == "true":
                                 applied_count += 1
+                                self._record_sent()
                                 print(
                                     "📨 Отправили отклик на вакансию с тестом",
                                     vacancy["alternate_url"],
@@ -1254,6 +1296,7 @@ class Operation(BaseOperation):
                             )
                             assert res == {}
                             applied_count += 1
+                            self._record_sent()
                             print(
                                 "📨 Отправили отклик на вакансию",
                                 vacancy["alternate_url"],
@@ -1264,30 +1307,9 @@ class Operation(BaseOperation):
                         )
                         continue
                     except CaptchaRequired as ex:
-                        logger.warning(f"Требуется капча: {ex.captcha_url}")
-                        try:
-                            success = asyncio.run(
-                                self._solve_captcha_async(ex.captcha_url)
-                            )
-                            if success:
-                                if not self.dry_run:
-                                    res = self.api_client.post(
-                                        "/negotiations",
-                                        params,
-                                        delay=random.uniform(1, 3),
-                                    )
-                                    assert res == {}
-                                    applied_count += 1
-                                    print(
-                                        "📨 Отправили отклик на вакансию после капчи",
-                                        vacancy["alternate_url"],
-                                    )
-                            else:
-                                logger.error("Не удалось решить капчу")
-                                raise
-                        except Exception as e:
-                            logger.error(f"Ошибка при решении капчи: {e}")
-                            raise
+                        # Капчу вводит владелец в Telegram-боте; вакансия
+                        # вернётся в работу при продолжении прогона
+                        raise VacancyCaptcha(ex.captcha_url) from ex
 
                 # Отправка письма на email
                 if self.args.send_email:
@@ -1330,6 +1352,15 @@ class Operation(BaseOperation):
                             )
                         except Exception as ex:
                             logger.error(f"Ошибка отправки письма: {ex}")
+            except VacancyCaptcha as ex:
+                logger.warning("hh запросил капчу: %s", ex)
+                self._prepare_captcha(ex.captcha_url)
+                print(
+                    "⏸ hh запросил капчу — ставлю отклики на паузу, "
+                    "продолжу после ввода капчи"
+                )
+                self.captcha_paused = True
+                break
             except LimitExceeded:
                 do_apply = False
                 limit_reached = True
@@ -1350,6 +1381,8 @@ class Operation(BaseOperation):
                     vacancy.get("alternate_url"),
                     ex,
                 )
+
+        self._forget_vacancies()
 
         logger.info(
             "Закончили рассылку откликов для резюме: %s (%s). Отправлено: %d",
@@ -1647,21 +1680,54 @@ class Operation(BaseOperation):
     def _get_vacancies(
         self, resume_id: str | None = None
     ) -> Iterator[SearchVacancy]:
+        similar = f"/resumes/{resume_id}/similar_vacancies"
+        if not self.search:
+            yield from self._paginate(similar, {})
+            return
+
+        # Сначала самое релевантное: рекомендации hh под это резюме, затем
+        # поиск в приоритетном регионе, затем везде. Повторы пропускаем
+        sources: list[tuple[str, dict[str, Any]]] = []
+        priority_area = getattr(self, "priority_area", None)
+        if self.area:
+            priority_area = None
+        if getattr(self, "recommended_first", False) and resume_id:
+            # Рекомендации — тоже только из приоритетного региона, иначе hh
+            # подмешивает вакансии из других стран раньше своих
+            recommended = {"text": None, "search_field": None}
+            if priority_area:
+                recommended["area"] = list(priority_area)
+            sources.append((similar, recommended))
+        if priority_area:
+            sources.append(("/vacancies", {"area": list(priority_area)}))
+        other_areas = getattr(self, "other_areas", None) or "all"
+        if not priority_area or other_areas == "all":
+            sources.append(("/vacancies", {}))
+        elif other_areas == "remote":
+            # Из других стран интересна только удалёнка
+            sources.append(("/vacancies", {"work_format": ["REMOTE"]}))
+
+        seen: set[str] = set()
+        for url, overrides in sources:
+            for vacancy in self._paginate(url, overrides):
+                if vacancy["id"] in seen:
+                    continue
+                seen.add(vacancy["id"])
+                yield vacancy
+
+    def _paginate(
+        self, url: str, overrides: dict[str, Any]
+    ) -> Iterator[SearchVacancy]:
         for page in range(self.total_pages):
-            logger.debug(f"Загружаем вакансии со страницы: {page + 1}")
+            logger.debug("Загружаем вакансии: %s, страница %d", url, page + 1)
             params = self._get_search_params(page)
+            for key, value in overrides.items():
+                if value is None:
+                    params.pop(key, None)
+                else:
+                    params[key] = value
 
-            if self.search:
-                res: PaginatedItems[SearchVacancy] = self.api_client.get(
-                    "/vacancies",
-                    params,
-                )
-            else:
-                res: PaginatedItems[SearchVacancy] = self.api_client.get(
-                    f"/resumes/{resume_id}/similar_vacancies",
-                    params,
-                )
-
+            res: PaginatedItems[SearchVacancy] = self.api_client.get(url, params)
             logger.debug(f"Количество вакансий: {res['found']}")
 
             if not res["items"]:
@@ -1685,30 +1751,78 @@ class Operation(BaseOperation):
             )
         )
 
-    def _vacancy_description(self, vacancy: SearchVacancy) -> str:
-        """Полный текст вакансии; кэш, чтобы оба фильтра не грузили его дважды."""
-        vacancy_id = str(vacancy["id"])
-        cache = self.__dict__.setdefault("_description_cache", {})
-        if vacancy_id not in cache:
-            try:
-                full = self.api_client.get(f"/vacancies/{vacancy_id}")
-                cache[vacancy_id] = strip_tags(
-                    full.get("description") or ""
-                ) + " " + " ".join(
-                    s.get("name", "") for s in full.get("key_skills") or []
-                )
-            except ApiError as ex:
-                logger.warning("Не удалось получить вакансию %s: %s", vacancy_id, ex)
-                cache[vacancy_id] = ""
-        return cache[vacancy_id]
+    def _record_sent(self) -> None:
+        """Время отклика: hh считает лимит 200 за скользящие 24 часа."""
+        try:
+            with (self.tool.config_path / SENT_TIMES_FILENAME).open("a") as fp:
+                fp.write(f"{time.time():.0f}\n")
+        except (OSError, TypeError, AttributeError) as ex:
+            logger.debug("Не удалось записать время отклика: %s", ex)
+
+    def _prepare_captcha(self, captcha_url: str | None) -> None:
+        """Картинка капчи для владельца: её пришлёт Telegram-бот."""
+        if not captcha_url:
+            return
+        try:
+            hhcaptcha.prepare(self.tool, captcha_url)
+        except Exception as ex:
+            logger.warning("Не удалось подготовить картинку капчи: %s", ex)
+
+    def _forget_vacancies(self) -> None:
+        """Кэш живёт только пока идёт работа над одной вакансией."""
+        self.__dict__.pop("_vacancy_cache", None)
+
+    def _full_vacancy(self, vacancy_id: str | int) -> dict:
+        """Вакансия целиком, не больше одного запроса на вакансию за прогон.
+
+        hh включает капчу, если открывать вакансии слишком часто, поэтому
+        между запросами — пауза, а капча останавливает прогон (VacancyCaptcha),
+        а не превращается в «пустую» вакансию.
+        """
+        vacancy_id = str(vacancy_id)
+        cache = self.__dict__.setdefault("_vacancy_cache", {})
+        if vacancy_id in cache:
+            return cache[vacancy_id]
+        low, high = self.vacancy_fetch_delay
+        if high > 0:
+            time.sleep(random.uniform(low, high))
+        try:
+            full = self.api_client.get(f"/vacancies/{vacancy_id}")
+        except CaptchaRequired as ex:
+            raise VacancyCaptcha(ex.captcha_url) from ex
+        if len(cache) >= VACANCY_CACHE_SIZE:
+            cache.pop(next(iter(cache)))
+        cache[vacancy_id] = full
+        return full
+
+    def _vacancy_description(self, vacancy: SearchVacancy) -> str | None:
+        """Описание и ключевые навыки; None — вакансию получить не удалось."""
+        try:
+            full = self._full_vacancy(vacancy["id"])
+        except ApiError as ex:
+            logger.warning("Не удалось получить вакансию %s: %s", vacancy["id"], ex)
+            return None
+        return (
+            strip_tags(full.get("description") or "")
+            + " "
+            + " ".join(s.get("name", "") for s in full.get("key_skills") or [])
+        )
 
     def _is_included(self, vacancy: SearchVacancy) -> bool:
         if not self.included_filter:
             return True
         pattern = re.compile(self.included_filter, re.IGNORECASE)
+        if "name" in (getattr(self, "search_field", None) or []):
+            # Ищем по названию — и ключевые слова только в названии: в
+            # сниппете «Python» или «ML» мелькают у аналитиков, ассистентов и
+            # руководителей. В описание не лезем: каждый лишний просмотр
+            # вакансии приближает капчу hh
+            return bool(pattern.search(vacancy.get("name") or ""))
         if pattern.search(self._vacancy_summary(vacancy)):
             return True
-        return bool(pattern.search(self._vacancy_description(vacancy)))
+        description = self._vacancy_description(vacancy)
+        # Не смогли проверить — не отбрасываем: поиск hh уже нашёл её по словам
+        return description is None or bool(pattern.search(description))
 
     def _is_excluded(self, vacancy: SearchVacancy) -> bool:
         if not self.excluded_filter:
@@ -1732,12 +1846,26 @@ class Operation(BaseOperation):
             self.excluded_filter, re.IGNORECASE
         )
 
+        if "name" in (getattr(self, "search_field", None) or []):
+            # Ищем по названию — и стоп-слова смотрим в названии и компании:
+            # в описаниях «Java», «junior», «Сбер» встречаются мимоходом
+            # («будете менторить junior») и отсекали подходящие вакансии
+            title = " ".join(
+                filter(
+                    None,
+                    [vacancy.get("name"), (vacancy.get("employer") or {}).get("name")],
+                )
+            )
+            return bool(excluded_pat.search(title))
+
         if excluded_pat.search(vacancy_summary):
             return True
 
         # Полный текст — только если сниппет не сработал. Берём из API:
         # страница hh.ru/vacancy/… с сервера часто отвечает 403 (антибот)
         description = self._vacancy_description(vacancy)
+        if description is None:
+            return False
         logger.debug(description[:2047])
         return bool(excluded_pat.search(description))
 

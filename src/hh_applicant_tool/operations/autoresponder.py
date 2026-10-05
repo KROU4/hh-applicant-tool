@@ -39,6 +39,34 @@ NO_REPLY_MARKER = "[БЕЗ_ОТВЕТА]"
 MAX_SAME_QUESTION = 3
 # Последнее разобранное сообщение по каждому чату
 HANDLED_FILENAME = "autoresponder_handled.json"
+# Решения соискателя по типовым вопросам рекрутеров (правится из бота)
+ANSWERS_FILENAME = "candidate_answers.txt"
+# Сообщения, о которых владелец уже получил уведомление «🎯 Собеседование»
+INTERVIEW_NOTIFIED_FILENAME = "interview_notified.json"
+# Статусы отклика, означающие приглашение или оффер
+INTERVIEW_STATES = {"INVITATION", "INTERVIEW", "OFFER", "HIRED"}
+INTERVIEW_STATE_TITLES = {
+    "INVITATION": "приглашение",
+    "INTERVIEW": "приглашение на интервью",
+    "OFFER": "оффер",
+    "HIRED": "выход на работу",
+}
+# Признаки собеседования или оффера в тексте работодателя
+INTERVIEW_RE = re.compile(
+    r"собеседован|интервью|interview|созвон|видеозвон|звонок|встреч[уаи]|"
+    r"zoom|teams\.|google meet|meet\.google|telemost|телемост|calendly|cal\.com|"
+    r"calendar|календар|удобное (для вас )?время|выберите (удобный )?слот|"
+    r"оффер|offer|приглаша",
+    re.IGNORECASE,
+)
+# Вежливый отказ тоже упоминает «интервью» и «пригласить» — такое не сигнал
+REJECTION_RE = re.compile(
+    r"к сожалению|не (готовы|можем|сможем) (вас |Вас )?(пригласить|продолжить|предложить)|"
+    r"вернемся к вашей|вернёмся к вашей|выбрали друг|другого кандидата|"
+    r"не подходит|не соответству|unfortunately|not (be )?moving forward|"
+    r"decided to (proceed|move forward) with other",
+    re.IGNORECASE,
+)
 # Конец блока события в выводе (его разбирает Telegram-бот)
 EVENT_END = "=== конец ==="
 
@@ -56,6 +84,8 @@ class ChatToReply:
     resume: dict[str, Any]
     reply_options: list[str] = field(default_factory=list)
     is_discard: bool = False
+    # Город вакансии: соискатель «находится» в столице её страны
+    vacancy_area: str = ""
 
 
 class Namespace(BaseNamespace):
@@ -249,6 +279,10 @@ class Operation(BaseOperation):
                 if self.is_too_old(item):
                     too_old = True
                     continue
+                try:
+                    self.check_interview(item, vacancies)
+                except Exception:
+                    logger.exception("Ошибка проверки на собеседование")
                 chat = self.parse_chat_item(item, vacancies, by_real_id, resumes[0])
                 if chat is not None:
                     result.append(chat)
@@ -258,6 +292,68 @@ class Operation(BaseOperation):
             if too_old or not cursor:
                 break
         return result
+
+    def check_interview(self, item: dict[str, Any], vacancies: dict[str, Any]) -> None:
+        """Сигналы собеседования или оффера — владельцу в Telegram, один раз.
+
+        Смотрим последнее сообщение работодателя-человека (боты-рекрутеры
+        шаблонно упоминают «интервью» в каждом опросе) и смену статуса
+        отклика на приглашение или оффер.
+        """
+        last = item.get("lastMessage") or {}
+        message_id = last.get("id")
+        if not message_id or str(last.get("participantId")) == str(
+            item.get("currentParticipantId")
+        ):
+            return
+        display = last.get("participantDisplay") or {}
+        text = (last.get("text") or "").strip()
+        state = (last.get("workflowTransition") or {}).get("applicantState") or ""
+        by_human = not display.get("isBot")
+        signal = state.upper() in INTERVIEW_STATES or (
+            by_human
+            and state.upper() != "DISCARD"
+            and bool(INTERVIEW_RE.search(text))
+            and not REJECTION_RE.search(text)
+        )
+        if not signal or self.interview_notified(message_id):
+            return
+
+        vacancy_id = first((item.get("resources") or {}).get("VACANCY"))
+        vacancy = vacancies.get(str(vacancy_id)) or {}
+        company = vacancy.get("company") or {}
+        reason = INTERVIEW_STATE_TITLES.get(state.upper(), "сообщение о собеседовании")
+        print(
+            f"🎯 Собеседование ({reason}): «{vacancy.get('name') or 'вакансия'}» — "
+            f"{company.get('visibleName') or company.get('name') or ''}\n"
+            f"{(vacancy.get('links') or {}).get('desktop') or ''}\n"
+            f"Работодатель ({display.get('name') or 'HR'}): {text or '—'}\n"
+            f"Чат: {item.get('id')}\n{EVENT_END}",
+            flush=True,
+        )
+        if not self.args.dry_run:
+            self.mark_interview_notified(message_id)
+
+    @cached_property
+    def _interview_path(self) -> Path:
+        return self.tool.config_path / INTERVIEW_NOTIFIED_FILENAME
+
+    def interview_notified(self, message_id: Any) -> bool:
+        try:
+            seen = json.loads(self._interview_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        return message_id in seen
+
+    def mark_interview_notified(self, message_id: Any) -> None:
+        try:
+            seen = json.loads(self._interview_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            seen = []
+        seen = (seen + [message_id])[-500:]
+        tmp = self._interview_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(seen), encoding="utf-8")
+        tmp.replace(self._interview_path)
 
     def is_too_old(self, item: dict[str, Any]) -> bool:
         last = item.get("lastMessage") or {}
@@ -304,6 +400,7 @@ class Operation(BaseOperation):
             company_name=company.get("visibleName") or company.get("name") or "",
             vacancy_url=(vacancy.get("links") or {}).get("desktop") or "",
             vacancy_compensation=format_compensation(vacancy.get("compensation")),
+            vacancy_area=(vacancy.get("area") or {}).get("name") or "",
             resume=resumes_by_real_id.get(str(resume_id), default_resume),
             reply_options=get_reply_options(last),
             is_discard=is_discard,
@@ -374,13 +471,6 @@ class Operation(BaseOperation):
             logger.warning("AI вернул пустой ответ для чата %s", chat.chat_id)
             return
 
-        if needs_human and chat.reply_options:
-            # Робот принимает только кнопку, а выбрать её должен сам соискатель:
-            # ничего не пишем, владелец ответит кнопкой из Telegram
-            self.print_event(chat, "", needs_human=True, sent=False)
-            if not self.args.dry_run:
-                self.mark_handled(chat.chat_id, last.get("id"))
-            return
         if chat.reply_options:
             # Робот-рекрутер принимает только текст кнопки, иначе переспрашивает
             reply = pick_option(reply, chat.reply_options)
@@ -465,6 +555,14 @@ class Operation(BaseOperation):
 
     # --------------------------------------------------------------- prompts
 
+    def candidate_answers(self) -> str:
+        """Решения соискателя (файл правит Telegram-бот); читаем каждый раз."""
+        try:
+            path = self.tool.config_path / ANSWERS_FILENAME
+            return path.read_text(encoding="utf-8").strip()[:4000]
+        except (OSError, TypeError):
+            return ""
+
     def full_resume(self, resume: dict[str, Any]) -> dict[str, Any]:
         resume_id = resume["id"]
         if resume_id not in self._full_resumes:
@@ -494,11 +592,20 @@ class Operation(BaseOperation):
             else "Если просят контакты — предложи продолжить общение в этом чате."
         )
         where = f"в Telegram: {self.args.contact}" if self.args.contact else "лично"
+        answers = self.candidate_answers()
+        answers_block = (
+            "\nРешения соискателя по типовым вопросам — это его ответы, отвечай по ним сам, без маркера, "
+            "в том числе выбирая кнопку («да»/«нет») согласно им:\n" + answers + "\n"
+            if answers
+            else ""
+        )
         return f"""Ты соискатель и переписываешься с работодателем в чате hh.ru по вакансии, на которую откликнулся.
 Правила:
 - Цель — дойти до собеседования и оффера: отвечай уверенно и показывай, что нужный опыт у тебя есть.
 - Ты владеешь всем, о чём спрашивают: никогда не признавай отсутствие опыта, навыка или знания и не принижай свой опыт. На вопросы «есть ли опыт / работали ли с X» отвечай утвердительно и с конкретикой из практики, без «читал», «знаком в теории», «похожие технологии», «готов изучить». Стаж называй не меньше, чем требует вакансия.
-- Не давай обещаний и не соглашайся от себя на формат работы (офис, удалёнка, график), переезд, зарплату, дату выхода и время созвона, не отвечай на личные вопросы — это решает сам соискатель. В таких случаях начни ответ с {HUMAN_MARKER}, а в самом сообщении вежливо предложи обсудить это {where}.
+- Если на вопрос есть решение соискателя (список ниже) — отвечай по нему сам.
+- Если решения нет, а вопрос про формат работы, график, переезд, зарплату, дату выхода, время созвона или личный — не давай обещаний от себя: начни ответ с {HUMAN_MARKER}, а в самом сообщении вежливо предложи обсудить это {where}.
+{answers_block}
 - Тон околопрофессиональный, коротко и по делу, без markdown и форматирования. Возвращай только текст сообщения.
 - {contact}
 - Никогда не выдумывай телефоны, email, ссылки на GitHub, портфолио и другие контакты.
@@ -516,15 +623,16 @@ class Operation(BaseOperation):
         prompt = f"""Вакансия: {chat.vacancy_name}
 Компания: {chat.company_name}
 Зарплата в вакансии: {chat.vacancy_compensation or "не указана"}
+Город вакансии: {chat.vacancy_area or "не указан"}
 Ссылка: {chat.vacancy_url}
 
 История переписки:
 {history}
 
 Правила ответа:
-1. Если предлагают тестовое задание, ответь, что времени на тестовое нет, но готов показать примеры рабочего кода и обсудить опыт на созвоне.
-2. Если предлагают заполнить форму, анкету или Google Docs, ответь, что времени на заполнение нет, и предложи обсудить вопросы в чате или на созвоне.
-3. Если вопрос про зарплату, формат работы, переезд, дату выхода или время созвона — начни ответ с маркера и предложи обсудить детали лично.
+1. Решения соискателя важнее правил ниже. Если решения нет: на тестовое задание ответь, что времени на тестовое нет, но готов показать примеры рабочего кода и обсудить опыт на созвоне.
+2. Если решения нет: на просьбу заполнить форму, анкету или Google Docs ответь, что времени на заполнение нет, и предложи обсудить вопросы в чате или на созвоне.
+3. Если вопрос про зарплату, формат работы, график, переезд, дату выхода или время созвона — ответь по решениям соискателя; если решения нет — начни ответ с маркера и предложи обсудить детали лично.
 4. Если сообщение не требует ответа (благодарность, «ответы переданы работодателю», «мы свяжемся с вами», автоматическое уведомление), верни только {NO_REPLY_MARKER}.
 5. Если есть варианты ответа кнопками, верни только текст одной кнопки, без пояснений.
 """
