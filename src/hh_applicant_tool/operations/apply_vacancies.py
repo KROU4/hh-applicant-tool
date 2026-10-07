@@ -47,6 +47,9 @@ DRY_RUN_END = "=== конец ==="
 CAPTCHA_EXIT_CODE = 3
 # Сколько полных вакансий держать в памяти (сервер маленький)
 VACANCY_CACHE_SIZE = 50
+# Обрыв соединения при загрузке выдачи: столько попыток, пауза растёт
+PAGE_RETRIES = 3
+PAGE_RETRY_DELAY = 10
 
 
 # Время каждого отправленного отклика (для лимита hh за 24 часа)
@@ -1727,7 +1730,7 @@ class Operation(BaseOperation):
                 else:
                     params[key] = value
 
-            res: PaginatedItems[SearchVacancy] = self.api_client.get(url, params)
+            res: PaginatedItems[SearchVacancy] = self._get_page(url, params)
             logger.debug(f"Количество вакансий: {res['found']}")
 
             if not res["items"]:
@@ -1737,6 +1740,17 @@ class Operation(BaseOperation):
 
             if page >= res["pages"] - 1:
                 return
+
+    def _get_page(self, url: str, params: dict[str, Any]) -> Any:
+        """Страница выдачи; обрыв соединения с hh повторяем, а не роняем прогон."""
+        for attempt in range(PAGE_RETRIES):
+            try:
+                return self.api_client.get(url, params)
+            except requests.RequestException as ex:
+                if attempt == PAGE_RETRIES - 1:
+                    raise
+                logger.warning("Сеть: %s — повторяю загрузку вакансий", ex)
+                time.sleep(PAGE_RETRY_DELAY * (attempt + 1))
 
     def _vacancy_summary(self, vacancy: SearchVacancy) -> str:
         snippet = vacancy.get("snippet") or {}
