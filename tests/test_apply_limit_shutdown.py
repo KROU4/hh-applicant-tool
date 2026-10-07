@@ -402,3 +402,23 @@ def test_title_search_ignores_keywords_in_snippet():
     }
     assert not op._is_included(assistant)
     assert op._is_included({**_make_vacancy(2), "name": "ML-инженер"})
+
+
+def test_page_load_survives_connection_drop(monkeypatch):
+    import requests
+
+    from hh_applicant_tool.operations import apply_vacancies
+
+    monkeypatch.setattr(apply_vacancies.time, "sleep", lambda s: None)
+    op = _make_operation(max_responses=0)
+    page = {"items": [], "found": 0, "pages": 1}
+    op.tool.api_client.get.side_effect = [requests.ConnectionError("Remote end closed"), page]
+    assert op._get_page("/vacancies", {}) == page
+
+    op.tool.api_client.get.side_effect = requests.ConnectionError("down")
+    try:
+        op._get_page("/vacancies", {})
+    except requests.ConnectionError:
+        pass
+    else:
+        raise AssertionError("после всех попыток ошибка должна дойти до прогона")
