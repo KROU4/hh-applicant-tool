@@ -64,6 +64,7 @@ def is_permanent_apply_error(status: int | None, error: str | None) -> bool:
     """
     return (
         status in (400, 409, 422)
+        and isinstance(error, str)
         and bool(error)
         and error not in RETRYABLE_APPLY_ERRORS
     )
