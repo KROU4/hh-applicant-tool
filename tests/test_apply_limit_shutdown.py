@@ -422,3 +422,37 @@ def test_page_load_survives_connection_drop(monkeypatch):
         pass
     else:
         raise AssertionError("после всех попыток ошибка должна дойти до прогона")
+
+
+def test_rejected_test_vacancy_is_remembered_and_not_retried():
+    from hh_applicant_tool.operations.apply_vacancies import APPLY_FAILED_REASON
+
+    op = _make_operation(max_responses=0)
+    vacancy = {**_make_vacancy(7), "has_test": True}
+    op._solve_vacancy_test = MagicMock(
+        return_value={"error": "change-resume-visibility-denied", "_http_status": 400}
+    )
+    op._get_vacancies = lambda resume_id=None: iter([vacancy])
+    resume = {"id": "r1", "title": "Dev", "alternate_url": "u"}
+    user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+    op._apply_resume(resume=resume, user=user, seen_employers=set())
+    saved = op.tool.storage.skipped_vacancies.save.call_args.args[0]
+    assert saved["vacancy_id"] == "7" and saved["reason"] == APPLY_FAILED_REASON
+
+    # Следующий прогон: отметка есть — ни письма, ни запроса к hh
+    op._solve_vacancy_test.reset_mock()
+    op.tool.storage.skipped_vacancies.find.return_value = [saved]
+    op._get_vacancies = lambda resume_id=None: iter([vacancy])
+    op._apply_resume(resume=resume, user=user, seen_employers=set())
+    assert not op._solve_vacancy_test.called
+
+
+def test_only_permanent_hh_errors_block_vacancy():
+    from hh_applicant_tool.operations.apply_vacancies import is_permanent_apply_error
+
+    assert is_permanent_apply_error(400, "change-resume-visibility-denied")
+    assert not is_permanent_apply_error(400, "too-long-letter")
+    assert not is_permanent_apply_error(403, "forbidden")
+    assert not is_permanent_apply_error(429, "too-many-requests")
+    assert not is_permanent_apply_error(400, None)
+    assert not is_permanent_apply_error(None, "x")
