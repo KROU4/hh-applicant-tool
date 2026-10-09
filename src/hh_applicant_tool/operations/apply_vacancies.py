@@ -50,6 +50,8 @@ VACANCY_CACHE_SIZE = 50
 # Обрыв соединения при загрузке выдачи: столько попыток, пауза растёт
 PAGE_RETRIES = 3
 PAGE_RETRY_DELAY = 10
+# Отметка в skipped_vacancies: hh отверг отклик, повторять бессмысленно
+APPLY_FAILED_REASON = "apply_failed"
 
 
 # Время каждого отправленного отклика (для лимита hh за 24 часа)
@@ -1116,6 +1118,14 @@ class Operation(BaseOperation):
                         )
                         continue
 
+                if self._apply_failed_before(vacancy, resume["id"]):
+                    # Не тратим на неё письмо и запрос: hh уже отказал
+                    logger.debug(
+                        "hh раньше не принял отклик, пропускаем: %s",
+                        vacancy["alternate_url"],
+                    )
+                    continue
+
                 # Перед откликом выгружаем профиль компании
                 employer_id = employer.get("id")
                 if employer_id and employer_id not in seen_employers:
@@ -1268,6 +1278,13 @@ class Operation(BaseOperation):
                                         status if status is not None else "?",
                                         shorten(str(result), 300),
                                     )
+                                    if status is not None and 400 <= status < 500:
+                                        # hh отверг отклик (например,
+                                        # change-resume-visibility-denied) — то же
+                                        # будет и в следующий раз
+                                        self._save_skipped_vacancy(
+                                            vacancy, APPLY_FAILED_REASON, resume["id"]
+                                        )
                         else:
                             test_handled = True
                     except ValueError as ex:
@@ -1905,6 +1922,18 @@ class Operation(BaseOperation):
                 )
             )
 
+        except Exception:
+            return False
+
+    def _apply_failed_before(self, vacancy: SearchVacancy, resume_id: str) -> bool:
+        try:
+            return any(
+                self.tool.storage.skipped_vacancies.find(
+                    resume_id=resume_id,
+                    vacancy_id=vacancy["id"],
+                    reason=APPLY_FAILED_REASON,
+                )
+            )
         except Exception:
             return False
 
