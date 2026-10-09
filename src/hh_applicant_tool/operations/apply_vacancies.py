@@ -52,6 +52,21 @@ PAGE_RETRIES = 3
 PAGE_RETRY_DELAY = 10
 # Отметка в skipped_vacancies: hh отверг отклик, повторять бессмысленно
 APPLY_FAILED_REASON = "apply_failed"
+# Ошибки, которые зависят не от вакансии: письмо пишется заново, лимит
+# освободится — такие вакансии пробуем снова
+RETRYABLE_APPLY_ERRORS = {"too-long-letter", "negotiations-limit-exceeded"}
+
+
+def is_permanent_apply_error(status: int | None, error: str | None) -> bool:
+    """hh явно отказал по этой вакансии (400/409/422 с кодом ошибки).
+
+    403/429 и ответы без кода — антибот, сессия, частота запросов: временно.
+    """
+    return (
+        status in (400, 409, 422)
+        and bool(error)
+        and error not in RETRYABLE_APPLY_ERRORS
+    )
 
 
 # Время каждого отправленного отклика (для лимита hh за 24 часа)
@@ -1278,7 +1293,7 @@ class Operation(BaseOperation):
                                         status if status is not None else "?",
                                         shorten(str(result), 300),
                                     )
-                                    if status is not None and 400 <= status < 500:
+                                    if is_permanent_apply_error(status, err):
                                         # hh отверг отклик (например,
                                         # change-resume-visibility-denied) — то же
                                         # будет и в следующий раз

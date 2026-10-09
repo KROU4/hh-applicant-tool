@@ -445,3 +445,14 @@ def test_rejected_test_vacancy_is_remembered_and_not_retried():
     op._get_vacancies = lambda resume_id=None: iter([vacancy])
     op._apply_resume(resume=resume, user=user, seen_employers=set())
     assert not op._solve_vacancy_test.called
+
+
+def test_only_permanent_hh_errors_block_vacancy():
+    from hh_applicant_tool.operations.apply_vacancies import is_permanent_apply_error
+
+    assert is_permanent_apply_error(400, "change-resume-visibility-denied")
+    assert not is_permanent_apply_error(400, "too-long-letter")
+    assert not is_permanent_apply_error(403, "forbidden")
+    assert not is_permanent_apply_error(429, "too-many-requests")
+    assert not is_permanent_apply_error(400, None)
+    assert not is_permanent_apply_error(None, "x")
