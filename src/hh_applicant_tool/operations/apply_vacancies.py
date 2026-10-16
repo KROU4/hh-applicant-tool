@@ -181,6 +181,10 @@ class Operation(BaseOperation):
     total_applied: int = 0
     # Пауза между запросами полных вакансий (сек): реже капча hh
     vacancy_fetch_delay: tuple[float, float] = (3.0, 6.0)
+    # Пауза между откликами, секунды. Около отклика в минуту hh через
+    # 10–15 откликов закрывает отправку капчей
+    apply_interval: tuple[float, float] = (150.0, 300.0)
+    _last_apply_at: float | None = None
     captcha_paused: bool = False
     # Контакт в конце AI-письма (например, ссылка на Telegram)
     letter_contact: str = ""
@@ -1234,6 +1238,7 @@ class Operation(BaseOperation):
                     continue
 
                 test_handled = False
+                self._pace_apply()
 
                 if vacancy.get("has_test"):
                     logger.debug(
@@ -1773,6 +1778,17 @@ class Operation(BaseOperation):
 
             if page >= res["pages"] - 1:
                 return
+
+    def _pace_apply(self) -> None:
+        """Откликаемся не чаще раза в apply_interval (письмо пишется в счёт паузы)."""
+        low, high = self.apply_interval
+        now = time.monotonic()
+        if self._last_apply_at is not None and high > 0:
+            wait = random.uniform(low, high) - (now - self._last_apply_at)
+            if wait > 0:
+                logger.debug("Пауза перед откликом: %.0f с", wait)
+                time.sleep(wait)
+        self._last_apply_at = time.monotonic()
 
     def _get_page(self, url: str, params: dict[str, Any]) -> Any:
         """Страница выдачи; обрыв соединения с hh повторяем, а не роняем прогон."""

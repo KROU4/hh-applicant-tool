@@ -30,6 +30,7 @@ def _make_vacancy(i: int) -> dict:
 def _make_operation(max_responses: int = 5) -> Operation:
     op = Operation()
     op.vacancy_fetch_delay = (0.0, 0.0)
+    op.apply_interval = (0.0, 0.0)
     # Namespace-like args used by _apply_resume.
     # NOTE: `args` is a read-only property backed by `_args` (set in run()).
     op._args = SimpleNamespace(
@@ -456,3 +457,27 @@ def test_only_permanent_hh_errors_block_vacancy():
     assert not is_permanent_apply_error(429, "too-many-requests")
     assert not is_permanent_apply_error(400, None)
     assert not is_permanent_apply_error(None, "x")
+
+
+def test_applies_are_spaced_out(monkeypatch):
+    from hh_applicant_tool.operations import apply_vacancies
+
+    clock = [1000.0]
+    sleeps = []
+    monkeypatch.setattr(apply_vacancies.time, "monotonic", lambda: clock[0])
+
+    def fake_sleep(s):
+        sleeps.append(s)
+        clock[0] += s
+
+    monkeypatch.setattr(apply_vacancies.time, "sleep", fake_sleep)
+    monkeypatch.setattr(apply_vacancies.random, "uniform", lambda a, b: b)
+    op = _make_operation(max_responses=0)
+    op.apply_interval = (150.0, 300.0)
+    op._get_vacancies = lambda resume_id=None: iter(_make_vacancy(i) for i in range(3))
+    resume = {"id": "r1", "title": "Dev", "alternate_url": "u"}
+    user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+    op._apply_resume(resume=resume, user=user, seen_employers=set())
+    assert op.tool.api_client.post.call_count == 3
+    # Первый отклик сразу, дальше — пауза перед каждым
+    assert sleeps == [300.0, 300.0]
