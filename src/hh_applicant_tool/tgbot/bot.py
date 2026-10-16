@@ -85,6 +85,8 @@ UPDATE_RESUMES_EVERY = 4 * 3600
 APPLY_RETRY_DELAY = 30 * 60
 # После капчи hh ждём дольше
 CAPTCHA_RETRY_DELAY = 60 * 60
+# Предел роста паузы после капчи без ответа: 1 ч · 2^3 = 8 ч
+CAPTCHA_MAX_DOUBLINGS = 3
 # apply-vacancies завершается с этим кодом, если hh попросил капчу
 CAPTCHA_EXIT_CODE = 3
 # hh-applicant-tool captcha --answer: неверный ответ, новая картинка готова
@@ -1506,6 +1508,11 @@ class HHBot:
                 + "."
             )
         retry_note = ""
+        streak = 0
+        if task.name == "apply" and not dry_run and not task.stopped_by_user:
+            # Сколько прогонов подряд кончились капчей без ответа владельца
+            streak = int(self.state.last_run("captcha_streak")) + 1 if captcha else 0
+            self.state.mark_run("captcha_streak", streak)
         if (
             task.name == "apply"
             and code != 0
@@ -1515,8 +1522,12 @@ class HHBot:
             and self.apply_quota_left() > 0
         ):
             # Прогон оборвался — добираем суточную квоту, а не ждём сутки.
-            # После капчи ждём дольше: hh снимает её со временем
-            delay = CAPTCHA_RETRY_DELAY if captcha else APPLY_RETRY_DELAY
+            # После капчи ждём дольше: hh снимает её со временем. Капча без
+            # ответа подряд — пауза растёт (1, 2, 4, 8 ч): иначе каждый час
+            # новая картинка в Telegram и новый отказ hh
+            delay = APPLY_RETRY_DELAY
+            if captcha:
+                delay = CAPTCHA_RETRY_DELAY * 2 ** min(streak - 1, CAPTCHA_MAX_DOUBLINGS)
             retry_at = time.time() + delay
             self.state.mark_run("apply_next", retry_at)
             sch = self.state.get("schedule")
@@ -1584,6 +1595,7 @@ class HHBot:
         code, out, err = self.runner.run_sync(["captcha", f"--answer={answer}"])
         logger.info("Ответ на капчу из Telegram: код %s", code)
         if code == 0:
+            self.state.mark_run("captcha_streak", 0)
             started = self.start_task("apply")
             self.api.send_message(
                 chat_id,

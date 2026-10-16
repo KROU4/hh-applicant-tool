@@ -842,3 +842,23 @@ def test_run_without_more_vacancies_sleeps_until_next_day(bot):
     bot._on_task_finish(task, 0)
     assert bot.state.last_run("apply_next") > time.time() + 6 * 3600
     assert "💤 Подходящих вакансий больше нет" in bot.api.sent[-1][1]
+
+
+def test_unanswered_captcha_backs_off_and_answer_resets(bot):
+    bot.state.set("schedule", "apply_enabled", True)
+    bot.state.set("schedule", "hours_from", 0)
+    bot.state.set("schedule", "hours_to", 0)
+    (bot.runner.logs_dir / "apply.log").write_text("⏸ hh запросил капчу\n", encoding="utf-8")
+    delays = []
+    for _ in range(5):
+        task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies"])
+        task.proc.alive = False
+        before = time.time()
+        bot._on_task_finish(task, 3)
+        delays.append(round((bot.state.last_run("apply_next") - before) / 3600))
+    assert delays == [1, 2, 4, 8, 8]
+
+    bot.runner.run_sync = lambda args, timeout=90: (0, "ok", "")
+    bot.start_task = lambda name, scheduled=False: "Запущено"
+    bot.answer_captcha(OWNER, "abc12")
+    assert bot.state.last_run("captcha_streak") == 0
