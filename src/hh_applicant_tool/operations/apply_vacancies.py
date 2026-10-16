@@ -1238,7 +1238,9 @@ class Operation(BaseOperation):
                     continue
 
                 test_handled = False
-                self._pace_apply()
+                if not self._pace_apply():
+                    logger.info("Операция отменена пользователем")
+                    break
 
                 if vacancy.get("has_test"):
                     logger.debug(
@@ -1779,16 +1781,28 @@ class Operation(BaseOperation):
             if page >= res["pages"] - 1:
                 return
 
-    def _pace_apply(self) -> None:
-        """Откликаемся не чаще раза в apply_interval (письмо пишется в счёт паузы)."""
+    def _pace_apply(self) -> bool:
+        """Откликаемся не чаще раза в apply_interval (письмо пишется в счёт паузы).
+
+        False — во время паузы попросили остановиться (Ctrl+C, «Стоп» в боте):
+        бот ждёт мягкой остановки лишь секунды, а пауза длится минуты.
+        """
         low, high = self.apply_interval
         now = time.monotonic()
+        cancel = getattr(self, "_cancel_event", None)
         if self._last_apply_at is not None and high > 0:
             wait = random.uniform(low, high) - (now - self._last_apply_at)
             if wait > 0:
                 logger.debug("Пауза перед откликом: %.0f с", wait)
-                time.sleep(wait)
+                if cancel is not None:
+                    if cancel.wait(wait):
+                        return False
+                else:
+                    time.sleep(wait)
+        if cancel is not None and cancel.is_set():
+            return False
         self._last_apply_at = time.monotonic()
+        return True
 
     def _get_page(self, url: str, params: dict[str, Any]) -> Any:
         """Страница выдачи; обрыв соединения с hh повторяем, а не роняем прогон."""

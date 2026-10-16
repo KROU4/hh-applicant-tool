@@ -481,3 +481,17 @@ def test_applies_are_spaced_out(monkeypatch):
     assert op.tool.api_client.post.call_count == 3
     # Первый отклик сразу, дальше — пауза перед каждым
     assert sleeps == [300.0, 300.0]
+
+
+def test_stop_during_apply_pause_sends_nothing_more():
+    op = _make_operation(max_responses=0)
+    op.apply_interval = (300.0, 300.0)
+    cancel = threading.Event()
+    op._cancel_event = cancel
+    # Первый отклик уходит сразу; к паузе перед вторым пришла остановка
+    op.tool.api_client.post.side_effect = lambda *a, **k: cancel.set() or {}
+    op._get_vacancies = lambda resume_id=None: iter(_make_vacancy(i) for i in range(3))
+    resume = {"id": "r1", "title": "Dev", "alternate_url": "u"}
+    user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+    op._apply_resume(resume=resume, user=user, seen_employers=set())
+    assert op.tool.api_client.post.call_count == 1
