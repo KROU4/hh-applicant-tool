@@ -26,6 +26,7 @@ import requests
 import urllib3
 
 from . import ai, api, utils
+from .api.user_agent import generate_android_useragent
 from .constants import (
     CONFIG_DIR,
     CONFIG_FILENAME,
@@ -284,9 +285,29 @@ class HHApplicantTool(MegaTool):
             refresh_token=token.get("refresh_token"),
             access_expires_at=token.get("access_expires_at"),
             delay=self.api_delay or config.get("api_delay"),
-            user_agent=self.user_agent or config.get("user_agent"),
+            user_agent=self.user_agent or self._device_user_agent(),
             session=self.session,
         )
+
+    def _device_user_agent(self) -> str:
+        """Одно «устройство» на профиль.
+
+        Раньше каждый запуск придумывал новый телефон и UUID: для hh это
+        один аккаунт с десятков устройств, и он отвечал капчей на отклики.
+        """
+        if ua := self.config.get("user_agent"):
+            return ua
+        ua = generate_android_useragent()
+        # Файл перечитываем: его могли изменить параллельные процессы
+        saved = utils.Config(self.config_path / CONFIG_FILENAME)
+        if saved.get("user_agent"):
+            ua = saved["user_agent"]
+        else:
+            saved.save(user_agent=ua)
+            # Два процесса стартовали разом — берём то, что осталось в файле
+            ua = utils.Config(self.config_path / CONFIG_FILENAME).get("user_agent") or ua
+        self.config["user_agent"] = ua
+        return ua
 
     def get_me(self) -> api.datatypes.User:
         return self.api_client.get("/me")
