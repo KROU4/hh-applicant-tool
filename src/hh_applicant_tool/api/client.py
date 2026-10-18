@@ -63,8 +63,11 @@ class BaseClient:
         return self.session.proxies
 
     def _default_headers(self) -> dict[str, str]:
+        # Как у официального Android-приложения
         return {
+            "Accept": "application/json",
             "User-Agent": self.user_agent,
+            "X-Force-App-Access": "true",
             "X-HH-App-Active": "true",
         }
 

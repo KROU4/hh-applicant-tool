@@ -40,3 +40,22 @@ def test_save_token_keeps_changes_made_by_other_processes(tmp_path):
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["token"] == {"access_token": "new"}
     assert saved["openrouter"] == {"api_key": "sk-or-x"}
+
+
+def test_device_user_agent_is_generated_once_per_profile(tmp_path):
+    from hh_applicant_tool.main import HHApplicantTool
+
+    def make_tool():
+        tool = HHApplicantTool()
+        tool.config_dir = tmp_path
+        tool.profile_id = None
+        tool.user_agent = None
+        return tool
+
+    Config(tmp_path / "config.json").save(token={"access_token": "t"})
+    first = make_tool()._device_user_agent()
+    assert first.startswith("ru.hh.android/")
+    # Следующий запуск (другой процесс) — то же «устройство»
+    assert make_tool()._device_user_agent() == first
+    saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert saved["user_agent"] == first and saved["token"] == {"access_token": "t"}
