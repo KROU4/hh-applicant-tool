@@ -304,6 +304,8 @@ class HHApplicantTool(MegaTool):
             ua = saved["user_agent"]
         else:
             saved.save(user_agent=ua)
+            # Два процесса стартовали разом — берём то, что осталось в файле
+            ua = utils.Config(self.config_path / CONFIG_FILENAME).get("user_agent") or ua
         self.config["user_agent"] = ua
         return ua
 
