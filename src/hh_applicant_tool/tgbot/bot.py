@@ -1659,7 +1659,16 @@ class HHBot:
     # ------------------------------------------------------------ web login
 
     def web_login_active(self, now: float | None = None) -> bool:
-        return (now or time.time()) < self._web_login_until
+        if not self._web_login_until:
+            return False
+        if (now or time.time()) < self._web_login_until:
+            return True
+        # Владелец так и не прислал код — перестаём ждать его как код входа
+        self.finish_web_login()
+        for chat_id, key in list(self.pending_input.items()):
+            if key.startswith("weblogin:"):
+                self.pending_input.pop(chat_id, None)
+        return False
 
     def finish_web_login(self) -> None:
         """Вход закончен или отменён: задачи снова запускаются по расписанию."""
