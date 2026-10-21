@@ -40,6 +40,7 @@ WRONG_CAPTCHA_EXIT_CODE = 4
 LOGIN_HEADERS = {"X-Hhtmfrom": "", "X-Hhtmsource": "account_login"}
 # Незаконченный вход живёт не дольше: код из SMS всё равно протухнет
 PENDING_TTL = 30 * 60
+MAX_REDIRECTS = 8
 
 
 class LoginError(Exception):
@@ -136,8 +137,16 @@ class Operation(BaseOperation):
         if not login:
             raise LoginError("Пустой логин")
         clear(self.tool.config_path)
+        # Старый _xsrf из cookies.txt может не совпасть с тем, что выдаст
+        # страница входа: сервер сверяет заголовок именно с новым
+        jar = self.tool.session.cookies
+        for cookie in [c for c in jar if c.name == "_xsrf"]:
+            jar.clear(cookie.domain, cookie.path, cookie.name)
 
-        r = self.tool.session.get(self._authorize_url())
+        r, auth_code = self._follow(self._authorize_url())
+        if auth_code:
+            # Сайт и так помнит вход — сразу получаем токен
+            return self._finish(auth_code)
         redirect_url = r.url
         backurl = (parse_qs(urlsplit(redirect_url).query).get("backurl") or [""])[0]
         if not backurl:
@@ -197,25 +206,48 @@ class Operation(BaseOperation):
         if not (res.get("verification") or {}).get("success"):
             raise LoginError("hh не подтвердил вход")
 
-        r = self.tool.session.get(
-            urljoin(redirect_url, pending["backurl"]),
-            headers={"Referer": redirect_url},
-            allow_redirects=False,
-        )
-        location = r.headers.get("location") or ""
-        parts = urlsplit(location)
-        if parts.scheme != "hhandroid":
-            raise LoginError(f"Не получили код авторизации: HTTP {r.status_code} {location[:120]}")
-        auth_code = (parse_qs(parts.query).get("code") or [""])[0]
+        # Код принят — дальше повторять его бессмысленно
+        clear(self.tool.config_path)
+        r, auth_code = self._follow(urljoin(redirect_url, pending["backurl"]), redirect_url)
         if not auth_code:
-            raise LoginError("В ответе hh нет кода авторизации")
+            raise LoginError(
+                f"Не получили код авторизации (HTTP {r.status_code}) — начните вход заново"
+            )
+        return self._finish(auth_code)
 
+    def _finish(self, auth_code: str) -> int:
         api_client = self.tool.api_client
-        api_client.handle_access_token(api_client.oauth_client.authenticate(auth_code))
+        try:
+            token = api_client.oauth_client.authenticate(auth_code)
+        except Exception as ex:
+            raise LoginError(f"hh не выдал токен ({ex}) — начните вход заново") from ex
+        api_client.handle_access_token(token)
         # Токен и cookies сохранит main после операции
         clear(self.tool.config_path)
         print("🎉 Вход выполнен: токен и cookies сайта обновлены")
         return 0
+
+    def _follow(self, url: str, referer: str | None = None) -> tuple[Any, str | None]:
+        """Переходы по редиректам вручную: последний — hhandroid://…?code=.
+
+        requests не умеет схему hhandroid и упал бы на ней, поэтому код
+        авторизации забираем из Location сами.
+        """
+        headers = {"Referer": referer} if referer else {}
+        for _ in range(MAX_REDIRECTS):
+            r = self.tool.session.get(url, headers=headers, allow_redirects=False)
+            location = r.headers.get("location") or r.headers.get("Location") or ""
+            if r.status_code not in (301, 302, 303, 307, 308) or not location:
+                return r, None
+            parts = urlsplit(location)
+            if parts.scheme == "hhandroid":
+                code = (parse_qs(parts.query).get("code") or [""])[0]
+                if not code:
+                    raise LoginError("В ответе hh нет кода авторизации")
+                return r, code
+            headers = {"Referer": url}
+            url = urljoin(url, location)
+        raise LoginError("Слишком много переадресаций при входе")
 
     # --------------------------------------------------------- внутреннее
 

@@ -894,3 +894,13 @@ def test_apply_report_offers_login_when_site_session_expired(bot):
     _, text, markup = bot.api.sent[-1]
     assert "разлогинил" in text
     assert markup["inline_keyboard"][0][0]["callback_data"] == "weblogin:start"
+
+
+def test_tasks_do_not_start_during_web_login(bot):
+    bot._background = lambda fn: fn()
+    bot.runner.run_sync = lambda args, timeout=90: (0, "📨 hh отправил код по SMS", "")
+    bot.handle_update(callback("weblogin:start"))
+    assert bot.web_login_active()
+    assert "Идёт вход" in bot.start_task("apply")
+    bot.handle_update(callback("weblogin:cancel"))
+    assert not bot.web_login_active()

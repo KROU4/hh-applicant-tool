@@ -128,3 +128,27 @@ def test_wrong_code_keeps_step_for_retry(op, tmp_path):
 def test_code_without_request_is_rejected(op):
     with pytest.raises(web_login.LoginError, match="не начат"):
         op.confirm_code("1234")
+
+
+def test_already_logged_in_site_gives_token_at_once(op):
+    op.tool.session.get.side_effect = [
+        response(status=302, headers={"location": "/oauth/authorize?step=2"}),
+        response(status=302, headers={"location": "hhandroid://oauthresponse?code=FAST"}),
+    ]
+    assert op.request_code("me@example.com") == 0
+    op.tool.api_client.oauth_client.authenticate.assert_called_once_with("FAST")
+    assert not op.tool.session.post.called
+
+
+def test_token_error_after_code_asks_to_start_over(op, tmp_path):
+    session = op.tool.session
+    session.get.return_value = response(url=LOGIN_PAGE)
+    session.post.side_effect = [response(data={"success": True})]
+    op.request_code("me@example.com")
+    session.post.side_effect = [response(data={"success": True, "verification": {"success": True}})]
+    session.get.side_effect = None
+    session.get.return_value = response(status=302, headers={"location": "hhandroid://x?code=C"})
+    op.tool.api_client.oauth_client.authenticate.side_effect = RuntimeError("boom")
+    with pytest.raises(web_login.LoginError, match="заново"):
+        op.confirm_code("1234")
+    assert web_login.load_pending(tmp_path) is None

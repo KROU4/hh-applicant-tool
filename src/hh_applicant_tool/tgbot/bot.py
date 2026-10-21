@@ -95,6 +95,10 @@ CAPTCHA_WRONG_EXIT_CODE = 4
 WEB_LOGIN_CAPTCHA_EXIT_CODE = 3
 WEB_LOGIN_WRONG_CAPTCHA_EXIT_CODE = 4
 WEB_LOGIN_IMAGE = "login_captcha.png"
+# Сколько ждём кода от владельца, прежде чем вернуть расписание задач
+WEB_LOGIN_TIMEOUT = 30 * 60
+# web-login печатает это, когда вход завершён (в т.ч. сразу, без кода)
+WEB_LOGIN_DONE_MARK = "🎉"
 # apply-vacancies: сайт hh.ru разлогинил сессию, вакансии с тестом пропущены
 WEB_AUTH_EXPIRED_MARKER = "🔑 Сессия сайта hh.ru истекла"
 AUTORESPONDER_RESTART_EVERY = 6 * 3600
@@ -401,6 +405,8 @@ class HHBot:
         self.runner = runner or TaskRunner(config_path, self._on_task_finish)
         self.letter_path = config_path / "letter.txt"
         self.pending_input: dict[int, str] = {}
+        # До какого времени идёт вход по коду (задачи не запускаются)
+        self._web_login_until = 0.0
         # Один поток: апдейты обрабатываются строго по порядку (нажали «Поиск» →
         # прислали текст). Медленное уходит в _background.
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tg")
@@ -1193,11 +1199,12 @@ class HHBot:
             return
         elif action == "weblogin":
             if arg == "start":
-                self.start_web_login(chat_id)
-                answer = ""
-            else:
-                self.pending_input.pop(chat_id, None)
-                answer = "Вход отменён"
+                self.api.answer_callback(query["id"], "")
+                self._background(lambda: self.start_web_login(chat_id))
+                return
+            self.pending_input.pop(chat_id, None)
+            self.finish_web_login()
+            answer = "Вход отменён"
         elif action == "account" and arg == "whoami":
             self.api.answer_callback(query["id"], "Проверяю…")
 
@@ -1410,6 +1417,8 @@ class HHBot:
         return max(limit - self.applied_24h(now), 0)
 
     def start_task(self, name: str, *, scheduled: bool = False) -> str:
+        if self.web_login_active():
+            return "Идёт вход в hh — дождитесь его окончания"
         args = self.task_args(name)
         if name == "apply":
             own = self.state.get("apply", "max_responses")
@@ -1599,6 +1608,9 @@ class HHBot:
         image = hhcaptcha.image_path(self.config_path)
         if not owner or not image.exists():
             return False
+        if (self.pending_input.get(owner) or "").startswith("weblogin:"):
+            # Владелец сейчас вводит код входа — капча откликов подождёт
+            return False
         self.pending_input[owner] = "captcha"
         self.api.send_photo(
             owner,
@@ -1646,7 +1658,20 @@ class HHBot:
 
     # ------------------------------------------------------------ web login
 
+    def web_login_active(self, now: float | None = None) -> bool:
+        return (now or time.time()) < self._web_login_until
+
+    def finish_web_login(self) -> None:
+        """Вход закончен или отменён: задачи снова запускаются по расписанию."""
+        self._web_login_until = 0.0
+
     def start_web_login(self, chat_id: int) -> None:
+        # Пока идёт вход, никаких других операций: каждая при выходе
+        # записывает свои cookies и токен и затёрла бы свежий вход
+        self._web_login_until = time.time() + WEB_LOGIN_TIMEOUT
+        if self.runner.running_tasks():
+            self.api.send_message(chat_id, "⏳ Останавливаю отклики и автоответчик на время входа…")
+            self.runner.stop_all()
         self.pending_input[chat_id] = "weblogin:login"
         self.api.send_message(
             chat_id,
@@ -1679,16 +1704,22 @@ class HHBot:
         if code != 0:
             if step == "code" and "Проверьте код" in output:
                 self.pending_input[chat_id] = "weblogin:code"
+                markup = cancel
+            else:
+                # Вход не продолжить — возвращаем задачи по расписанию
+                self.finish_web_login()
+                markup = keyboard([button("🔑 Начать вход заново", "weblogin:start")])
             self.api.send_message(
-                chat_id, "⚠️ " + esc(output[-600:] or "Не удалось"), cancel
+                chat_id, "⚠️ " + esc(output[-600:] or "Не удалось"), markup
             )
             return
-        if step in ("login", "captcha"):
+        if step in ("login", "captcha") and WEB_LOGIN_DONE_MARK not in output:
             self.pending_input[chat_id] = "weblogin:code"
             self.api.send_message(
                 chat_id, esc(output) + "\nПришлите код одним сообщением:", cancel
             )
             return
+        self.finish_web_login()
         self.state.mark_run("captcha_streak", 0)
         self.api.send_message(
             chat_id,
@@ -1883,6 +1914,9 @@ class HHBot:
         # Без авторизации плановые задачи только сыпали бы ошибками
         token = self.tool_config().get("token") or {}
         if not token.get("access_token"):
+            return
+        if self.web_login_active(now):
+            # Идёт вход по коду: операции затёрли бы свежие cookies
             return
 
         if (
