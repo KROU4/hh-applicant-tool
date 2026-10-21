@@ -52,6 +52,10 @@ PAGE_RETRIES = 3
 PAGE_RETRY_DELAY = 10
 # Отметка в skipped_vacancies: hh отверг отклик, повторять бессмысленно
 APPLY_FAILED_REASON = "apply_failed"
+# Ошибка main.parse_redirect_config, когда сайт видит нас анонимом, и строка
+# для Telegram-бота (он предлагает войти по коду)
+WEB_AUTH_EXPIRED_TEXT = "Авторизация истекла"
+WEB_AUTH_EXPIRED_MARKER = "🔑 Сессия сайта hh.ru истекла"
 # Ошибки, которые зависят не от вакансии: письмо пишется заново, лимит
 # освободится — такие вакансии пробуем снова
 RETRYABLE_APPLY_ERRORS = {"too-long-letter", "negotiations-limit-exceeded"}
@@ -185,6 +189,8 @@ class Operation(BaseOperation):
     # 10–15 откликов закрывает отправку капчей
     apply_interval: tuple[float, float] = (150.0, 300.0)
     _last_apply_at: float | None = None
+    # Сайт hh.ru разлогинил сессию — вакансии с тестом не отправить
+    _web_auth_expired: bool = False
     captcha_paused: bool = False
     # Контакт в конце AI-письма (например, ссылка на Telegram)
     letter_contact: str = ""
@@ -1058,7 +1064,9 @@ class Operation(BaseOperation):
                     )
                     continue
 
-                if vacancy.get("has_test") and self.args.skip_tests:
+                if vacancy.get("has_test") and (
+                    self.args.skip_tests or self._web_auth_expired
+                ):
                     logger.debug(
                         "Пропускаю вакансию с тестом %s",
                         vacancy["alternate_url"],
@@ -1322,6 +1330,11 @@ class Operation(BaseOperation):
                             continue
                     except Exception as ex:
                         logger.error(f"Произошла непредвиденная ошибка: {ex}")
+                        if WEB_AUTH_EXPIRED_TEXT in str(ex) and not self._web_auth_expired:
+                            # Тест решается через сайт, а сайт нас разлогинил:
+                            # остальные вакансии с тестом в этом прогоне не трогаем
+                            self._web_auth_expired = True
+                            print(WEB_AUTH_EXPIRED_MARKER, "— вакансии с тестом пропускаю")
                         continue
 
                 if not test_handled:
