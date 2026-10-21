@@ -862,3 +862,35 @@ def test_unanswered_captcha_backs_off_and_answer_resets(bot):
     bot.start_task = lambda name, scheduled=False: "Запущено"
     bot.answer_captcha(OWNER, "abc12")
     assert bot.state.last_run("captcha_streak") == 0
+
+
+def test_web_login_flow_with_captcha_and_code(bot):
+    bot._background = lambda fn: fn()
+    calls = []
+    results = iter([(3, "🔐 hh просит капчу", ""), (0, "📨 hh отправил код по SMS", ""), (0, "🎉", "")])
+    bot.runner.run_sync = lambda args, timeout=90: calls.append(args) or next(results)
+    (bot.config_path / "login_captcha.png").write_bytes(b"png")
+
+    bot.handle_update(callback("weblogin:start"))
+    bot.handle_update(message("+79991234567"))
+    assert calls[-1] == ["web-login", "--request=+79991234567"]
+    assert bot.api.photos  # картинка капчи входа ушла владельцу
+    bot.handle_update(message("abc12"))
+    assert calls[-1] == ["web-login", "--captcha=abc12"]
+    bot.handle_update(message("1234"))
+    assert calls[-1] == ["web-login", "--code=1234"]
+    assert any("Вход выполнен" in t for _, t, _ in bot.api.sent)
+
+
+def test_apply_report_offers_login_when_site_session_expired(bot):
+    (bot.runner.logs_dir / "apply.log").write_text(
+        "📨 Отправили отклик на вакансию https://hh.ru/vacancy/1\n"
+        "🔑 Сессия сайта hh.ru истекла — вакансии с тестом пропускаю\n",
+        encoding="utf-8",
+    )
+    task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies"])
+    task.proc.alive = False
+    bot._on_task_finish(task, 0)
+    _, text, markup = bot.api.sent[-1]
+    assert "разлогинил" in text
+    assert markup["inline_keyboard"][0][0]["callback_data"] == "weblogin:start"

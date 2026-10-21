@@ -91,6 +91,12 @@ CAPTCHA_MAX_DOUBLINGS = 3
 CAPTCHA_EXIT_CODE = 3
 # hh-applicant-tool captcha --answer: неверный ответ, новая картинка готова
 CAPTCHA_WRONG_EXIT_CODE = 4
+# Вход по коду (операция web-login): капча при запросе кода и её картинка
+WEB_LOGIN_CAPTCHA_EXIT_CODE = 3
+WEB_LOGIN_WRONG_CAPTCHA_EXIT_CODE = 4
+WEB_LOGIN_IMAGE = "login_captcha.png"
+# apply-vacancies: сайт hh.ru разлогинил сессию, вакансии с тестом пропущены
+WEB_AUTH_EXPIRED_MARKER = "🔑 Сессия сайта hh.ru истекла"
 AUTORESPONDER_RESTART_EVERY = 6 * 3600
 AUTORESPONDER_BACKOFF = 10 * 60
 REFRESH_TOKEN_EVERY = 20 * 3600
@@ -538,6 +544,10 @@ class HHBot:
             # Ответ на капчу hh (в т.ч. если бот перезапускался и забыл, что ждал)
             answer = text.strip()
             self._background(lambda: self.answer_captcha(chat_id, answer))
+            return
+        if key and key.startswith("weblogin:"):
+            step = key.removeprefix("weblogin:")
+            self._background(lambda: self.web_login_step(chat_id, step, text))
             return
         if key and key.startswith("reply:"):
             # Свой ответ работодателю в чат hh
@@ -1001,11 +1011,14 @@ class HHBot:
             lines += ["", self._account_cache]
         lines += [
             "",
-            "Перенос авторизации: выполните <code>hh-applicant-tool authorize</code> "
-            "на компьютере и пришлите сюда документами <code>config.json</code> "
-            "и <code>cookies.txt</code> из папки профиля.",
+            "Слетел вход (капча не помогает, вакансии с тестом не отправляются) — "
+            "нажмите «🔑 Войти по коду»: телефон или email, затем код от hh.",
+            "Или выполните <code>hh-applicant-tool authorize</code> на компьютере "
+            "и пришлите сюда документами <code>config.json</code> и "
+            "<code>cookies.txt</code> из папки профиля.",
         ]
         markup = keyboard(
+            [button("🔑 Войти по коду", "weblogin:start")],
             [button("🔍 Проверить вход (whoami)", "account:whoami")],
             [button("🔑 Обновить токен", "run:refresh_token")],
             [button("📄 Мои резюме", "screen:resumes")],
@@ -1178,6 +1191,13 @@ class HHBot:
 
             self._background(_test)
             return
+        elif action == "weblogin":
+            if arg == "start":
+                self.start_web_login(chat_id)
+                answer = ""
+            else:
+                self.pending_input.pop(chat_id, None)
+                answer = "Вход отменён"
         elif action == "account" and arg == "whoami":
             self.api.answer_callback(query["id"], "Проверяю…")
 
@@ -1555,10 +1575,18 @@ class HHBot:
         if auth_problem:
             text += "\n\n🔑 Похоже, слетела авторизация — загляните в 👤 Аккаунт."
         text += retry_note + limit_note
+        rows = [[button("📜 Полный лог", f"log:{task.name}"), button("🏠 Меню", "screen:main")]]
+        web_auth_expired = task.name == "apply" and WEB_AUTH_EXPIRED_MARKER in log
+        if web_auth_expired:
+            text += (
+                "\n\n🔑 Сайт hh.ru разлогинил бота: вакансии с тестом пропущены. "
+                "Войдите заново по коду — займёт минуту."
+            )
+            rows.insert(0, [button("🔑 Войти по коду", "weblogin:start")])
         self.notify(
             text,
-            silent=task.scheduled and code == 0,
-            markup=keyboard([button("📜 Полный лог", f"log:{task.name}"), button("🏠 Меню", "screen:main")]),
+            silent=task.scheduled and code == 0 and not web_auth_expired,
+            markup=keyboard(*rows),
         )
         if captcha:
             self.ask_captcha()
@@ -1615,6 +1643,59 @@ class HHBot:
                 + esc(ANSI_RE.sub("", err or out)[-600:])
                 + "</pre>\nПопробую снова при следующем прогоне.",
             )
+
+    # ------------------------------------------------------------ web login
+
+    def start_web_login(self, chat_id: int) -> None:
+        self.pending_input[chat_id] = "weblogin:login"
+        self.api.send_message(
+            chat_id,
+            "🔑 <b>Вход в hh.ru по коду</b>\nПришлите телефон или email от аккаунта hh — "
+            "hh пришлёт код, его тоже нужно будет прислать сюда.",
+            keyboard([button("✖️ Отмена", "weblogin:cancel")]),
+        )
+
+    def web_login_step(self, chat_id: int, step: str, text: str) -> None:
+        """Шаг входа: login → (капча) → code. Каждый — запуск web-login."""
+        option = {"login": "--request", "captcha": "--captcha", "code": "--code"}[step]
+        self.api.send_message(chat_id, "⏳ Отправляю в hh…")
+        code, out, err = self.runner.run_sync(["web-login", f"{option}={text}"], timeout=120)
+        logger.info("Вход по коду, шаг %s: код %s", step, code)
+        output = ANSI_RE.sub("", out or err).strip()
+        cancel = keyboard([button("✖️ Отмена", "weblogin:cancel")])
+        if code in (WEB_LOGIN_CAPTCHA_EXIT_CODE, WEB_LOGIN_WRONG_CAPTCHA_EXIT_CODE):
+            self.pending_input[chat_id] = "weblogin:captcha"
+            image = self.config_path / WEB_LOGIN_IMAGE
+            caption = (
+                "❌ Неверно, вот новая картинка."
+                if code == WEB_LOGIN_WRONG_CAPTCHA_EXIT_CODE
+                else "🔐 hh просит капчу перед отправкой кода."
+            ) + " Пришлите текст с картинки:"
+            if image.exists():
+                self.api.send_photo(chat_id, image, caption, reply_markup=cancel)
+            else:
+                self.api.send_message(chat_id, caption, cancel)
+            return
+        if code != 0:
+            if step == "code" and "Проверьте код" in output:
+                self.pending_input[chat_id] = "weblogin:code"
+            self.api.send_message(
+                chat_id, "⚠️ " + esc(output[-600:] or "Не удалось"), cancel
+            )
+            return
+        if step in ("login", "captcha"):
+            self.pending_input[chat_id] = "weblogin:code"
+            self.api.send_message(
+                chat_id, esc(output) + "\nПришлите код одним сообщением:", cancel
+            )
+            return
+        self.state.mark_run("captcha_streak", 0)
+        self.api.send_message(
+            chat_id,
+            "✅ Вход выполнен: токен и cookies сайта обновлены. Отклики на вакансии "
+            "с тестом снова работают.",
+        )
+        self.send_screen(chat_id, "account")
 
     def refresh_captcha(self, chat_id: int) -> None:
         code, out, err = self.runner.run_sync(["captcha", "--refresh"])

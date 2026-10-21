@@ -495,3 +495,17 @@ def test_stop_during_apply_pause_sends_nothing_more():
     user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
     op._apply_resume(resume=resume, user=user, seen_employers=set())
     assert op.tool.api_client.post.call_count == 1
+
+
+def test_expired_site_session_skips_remaining_test_vacancies(capsys):
+    op = _make_operation(max_responses=0)
+    op._solve_vacancy_test = MagicMock(side_effect=Exception("Авторизация истекла требуется новая!"))
+    vacancies = [{**_make_vacancy(i), "has_test": True} for i in range(3)] + [_make_vacancy(9)]
+    op._get_vacancies = lambda resume_id=None: iter(vacancies)
+    resume = {"id": "r1", "title": "Dev", "alternate_url": "u"}
+    user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+    op._apply_resume(resume=resume, user=user, seen_employers=set())
+    # Сайт разлогинил один раз — остальные с тестом не трогаем, обычная ушла
+    assert op._solve_vacancy_test.call_count == 1
+    assert op.tool.api_client.post.call_count == 1
+    assert capsys.readouterr().out.count("Сессия сайта hh.ru истекла") == 1
