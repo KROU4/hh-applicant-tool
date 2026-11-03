@@ -193,7 +193,7 @@ class Operation(BaseOperation):
     # Сайт hh.ru разлогинил сессию — вакансии с тестом не отправить
     _web_auth_expired: bool = False
     # Подходящие вакансии с тестом, пропущенные из-за этого за запуск (id)
-    _tests_skipped: set[str] = frozenset()
+    _tests_skipped: frozenset[str] | set[str] = frozenset()
     captcha_paused: bool = False
     # Контакт в конце AI-письма (например, ссылка на Telegram)
     letter_contact: str = ""
