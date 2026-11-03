@@ -192,8 +192,8 @@ class Operation(BaseOperation):
     _last_apply_at: float | None = None
     # Сайт hh.ru разлогинил сессию — вакансии с тестом не отправить
     _web_auth_expired: bool = False
-    # Сколько вакансий с тестом пропущено из-за этого за запуск
-    _tests_skipped: int = 0
+    # Подходящие вакансии с тестом, пропущенные из-за этого за запуск (id)
+    _tests_skipped: set[str] = frozenset()
     captcha_paused: bool = False
     # Контакт в конце AI-письма (например, ссылка на Telegram)
     letter_contact: str = ""
@@ -479,6 +479,13 @@ class Operation(BaseOperation):
         self.excluded_filter = args.excluded_filter
         self.included_filter = args.included_filter
         self.priority_filter = args.priority_filter
+        if self.priority_filter:
+            try:
+                re.compile(self.priority_filter)
+            except re.error as ex:
+                # До анализа резюме через AI, а не посреди прогона
+                logger.error("Некорректный --priority-filter: %s", ex)
+                return 1
         self.recommended_first = bool(args.recommended_first)
         self.priority_area = args.priority_area
         self.other_areas = args.other_areas
@@ -1083,6 +1090,21 @@ class Operation(BaseOperation):
                     )
                     continue
 
+                skip_test = bool(vacancy.get("has_test")) and (
+                    self.args.skip_tests or self._web_auth_expired
+                )
+                title_only = "name" in (getattr(self, "search_field", None) or [])
+                if skip_test and not title_only:
+                    # Фильтры по описанию открывали бы вакансию целиком — лишний
+                    # просмотр и шаг к капче ради вакансии, которую всё равно
+                    # пропустим
+                    logger.debug(
+                        "Пропускаю вакансию с тестом %s",
+                        vacancy["alternate_url"],
+                    )
+                    self._count_skipped_test(vacancy, resume["id"])
+                    continue
+
                 if not self._is_included(vacancy):
                     logger.info(
                         "Вакансия не содержит ключевых слов: %s",
@@ -1112,17 +1134,14 @@ class Operation(BaseOperation):
                     )
                     continue
 
-                # После фильтров: в счёт пропущенных из-за сайта идут только
-                # подходящие вакансии
-                if vacancy.get("has_test") and (
-                    self.args.skip_tests or self._web_auth_expired
-                ):
+                # При поиске по названию фильтры дешёвые — после них в счёт
+                # пропущенных из-за сайта идут только подходящие вакансии
+                if skip_test:
                     logger.debug(
                         "Пропускаю вакансию с тестом %s",
                         vacancy["alternate_url"],
                     )
-                    if self._web_auth_expired:
-                        self._tests_skipped += 1
+                    self._count_skipped_test(vacancy, resume["id"])
                     continue
 
                 # AI фильтрация вакансий
@@ -1349,7 +1368,7 @@ class Operation(BaseOperation):
                             # Тест решается через сайт, а сайт нас разлогинил:
                             # остальные вакансии с тестом в этом прогоне не трогаем
                             self._web_auth_expired = True
-                            self._tests_skipped += 1
+                            self._note_test_skipped(vacancy_id)
                             print(WEB_AUTH_EXPIRED_MARKER, "— вакансии с тестом пропускаю")
                         continue
 
@@ -1466,9 +1485,10 @@ class Operation(BaseOperation):
             f"✅️ Закончили рассылку для резюме: {resume['title']}. Отправлено: {applied_count}"
         )
         if self._tests_skipped:
+            # Итог за весь запуск (разные вакансии), бот берёт последний/max
             print(
                 f"{WEB_AUTH_EXPIRED_MARKER} — пропущено вакансий с тестом: "
-                f"{self._tests_skipped}"
+                f"{len(self._tests_skipped)}"
             )
         self.total_applied += applied_count
         return limit_reached
@@ -1765,8 +1785,12 @@ class Operation(BaseOperation):
         # день hh даёт отправить лишь несколько откликов до капчи, и они не
         # должны уходить на «Python-разработчика», пока ждёт «LLM Engineer»
         pattern = re.compile(self.priority_filter, re.IGNORECASE)
+        cancel = getattr(self, "_cancel_event", None)
         rest: list[SearchVacancy] = []
         for vacancy in vacancies:
+            if cancel is not None and cancel.is_set():
+                # Пока копятся «остальные», цикл откликов не видит отмену
+                return
             if pattern.search(vacancy.get("name") or ""):
                 yield vacancy
             else:
@@ -1833,6 +1857,24 @@ class Operation(BaseOperation):
 
             if page >= res["pages"] - 1:
                 return
+
+    def _count_skipped_test(self, vacancy: SearchVacancy, resume_id: str) -> None:
+        """Вакансия с тестом не отправлена из-за слетевшей сессии сайта.
+
+        Не считаем те, на которые отклика не было бы и с живой сессией:
+        hh уже отверг отклик или AI-фильтр раньше отклонил вакансию.
+        """
+        if not self._web_auth_expired:
+            return
+        if self._apply_failed_before(vacancy, resume_id):
+            return
+        if self.ai_filter and self._is_vacancy_already_skipped(vacancy, resume_id):
+            return
+        self._note_test_skipped(vacancy["id"])
+
+    def _note_test_skipped(self, vacancy_id: str) -> None:
+        # Своё множество у каждого запуска, а не общее у класса
+        self._tests_skipped = {*self._tests_skipped, vacancy_id}
 
     def _pace_apply(self) -> bool:
         """Откликаемся не чаще раза в apply_interval (письмо пишется в счёт паузы).

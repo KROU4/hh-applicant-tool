@@ -552,6 +552,43 @@ def test_expired_session_counts_only_suitable_test_vacancies(capsys):
     assert "пропущено вакансий с тестом: 1" in capsys.readouterr().out
 
 
+def test_skipped_test_vacancies_are_not_opened_by_description_filters():
+    op = _make_operation(max_responses=0)
+    op._args.skip_tests = True
+    op.included_filter = "llm"
+    op.search_field = None
+    vacancies = [{**_make_vacancy(i), "has_test": True} for i in range(5)]
+    op._get_vacancies = lambda resume_id=None: iter(vacancies)
+    resume = {"id": "r1", "title": "Dev", "alternate_url": "u"}
+    user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+    op._apply_resume(resume=resume, user=user, seen_employers=set())
+    # Фильтры по описанию не тянут вакансию целиком ради пропуска
+    assert not op.tool.api_client.get.called
+
+
+def test_already_rejected_test_vacancy_is_not_counted(capsys):
+    from hh_applicant_tool.operations.apply_vacancies import APPLY_FAILED_REASON
+
+    op = _make_operation(max_responses=0)
+    op._web_auth_expired = True
+    op.search_field = ["name"]
+    op.tool.storage.skipped_vacancies.find.side_effect = lambda **kw: (
+        [{"vacancy_id": "1", "reason": APPLY_FAILED_REASON}]
+        if kw.get("vacancy_id") == "1"
+        else []
+    )
+    vacancies = [{**_make_vacancy(i), "has_test": True} for i in (1, 2)]
+    op._get_vacancies = lambda resume_id=None: iter(vacancies)
+    resume = {"id": "r1", "title": "Dev", "alternate_url": "u"}
+    user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+    op._apply_resume(resume=resume, user=user, seen_employers=set())
+    op._apply_resume(resume=resume, user=user, seen_employers=set())
+    out = capsys.readouterr().out
+    # Отвергнутая hh не в счёт, повтор той же вакансии у второго резюме — тоже
+    assert "пропущено вакансий с тестом: 1" in out
+    assert "пропущено вакансий с тестом: 2" not in out
+
+
 def test_priority_titles_go_first_from_all_sources():
     op = _make_operation(max_responses=0)
     op.search = "python OR llm"
