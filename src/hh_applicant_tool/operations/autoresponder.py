@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import logging
 import re
@@ -35,6 +36,19 @@ MAX_MESSAGES = 20
 HUMAN_MARKER = "[НУЖЕН_ЧЕЛОВЕК]"
 # А этим — сообщения, на которые отвечать не нужно
 NO_REPLY_MARKER = "[БЕЗ_ОТВЕТА]"
+# Чаты без ответа работодателя старше этого срока не трогаем
+NUDGE_MAX_AGE = timedelta(days=30)
+# Сколько раз за чат можно напомнить о себе
+MAX_NUDGES = 3
+NUDGED_FILENAME = "autoresponder_nudged.json"
+DEFAULT_NUDGE_TEXT = (
+    "Здравствуйте! Подскажите, пожалуйста, актуальна ли ещё вакансия "
+    "и рассматривается ли моё резюме?"
+)
+# Живому работодателю отвечаем с задержкой, чтобы владелец успел сам
+HUMAN_REPLY_DELAY_MINUTES = 15
+# Насколько похожим на кнопку должен быть ответ модели
+FUZZY_CUTOFF = 0.7
 # Робот, повторяющий один вопрос, ждёт другого ответа — не зацикливаемся
 MAX_SAME_QUESTION = 3
 # Последнее разобранное сообщение по каждому чату
@@ -95,6 +109,9 @@ class Namespace(BaseNamespace):
     contact: str | None
     dry_run: bool
     once: bool
+    human_delay: int
+    nudge_days: int
+    nudge_text: str
     send_chat: int | None
     text: str | None
 
@@ -131,6 +148,21 @@ class Operation(BaseOperation):
             action="store_true",
             help="Не отправлять ответы и не удалять чаты, а только показать их",
         )
+        parser.add_argument(
+            "--human-delay",
+            type=int,
+            default=HUMAN_REPLY_DELAY_MINUTES,
+            help="Через сколько минут отвечать живому работодателю (0 — сразу). "
+            "Боту-рекрутеру отвечаем сразу",
+        )
+        parser.add_argument(
+            "--nudge-days",
+            type=int,
+            default=0,
+            help="Напомнить о себе в чате, где работодатель молчит столько дней "
+            f"(0 — не напоминать; не больше {MAX_NUDGES} раз на чат)",
+        )
+        parser.add_argument("--nudge-text", default=DEFAULT_NUDGE_TEXT)
         parser.add_argument(
             "--once",
             action="store_true",
@@ -197,6 +229,106 @@ class Operation(BaseOperation):
                 self.reply_to_chat(chat)
             except (ApiError, AIError, requests.RequestException) as ex:
                 logger.error("Ошибка в чате %s: %s", chat.chat_id, ex)
+        if getattr(self.args, "nudge_days", 0) > 0 and not cancel_event.is_set():
+            self.nudge_silent_chats(cancel_event)
+
+    # ---------------------------------------------------------------- nudge
+
+    def nudge_silent_chats(self, cancel_event: Event) -> None:
+        """Напоминание в чатах, где последним писали мы, а работодатель молчит."""
+        min_age = timedelta(days=self.args.nudge_days)
+        cursor = None
+        seen: set[int] = set()
+        for _ in range(self.args.max_pages):
+            params = {"filterUnread": "false", "filterHasTextMessage": "false"}
+            if cursor:
+                params["from"] = cursor
+            data = self._get(
+                "/chatik/api/chats",
+                params,
+                f"{self.chatik_url}/?platform=xhh&dest=iframe",
+            )
+            block = data.get("chats") or {}
+            items = [i for i in block.get("items") or [] if i.get("id") not in seen]
+            if not items:
+                return
+            for item in items:
+                if cancel_event.is_set():
+                    return
+                seen.add(item.get("id"))
+                age = self.last_message_age(item)
+                if age is None or age > NUDGE_MAX_AGE:
+                    # Чаты отсортированы по активности: дальше только старые
+                    return
+                if age < min_age or not self.is_nudge_candidate(item):
+                    continue
+                try:
+                    self.nudge_chat(item)
+                except (ApiError, requests.RequestException) as ex:
+                    logger.error("Не удалось напомнить в чате %s: %s", item.get("id"), ex)
+            cursor = block.get("nextFrom")
+            if not cursor:
+                return
+
+    @staticmethod
+    def last_message_age(item: dict[str, Any]) -> timedelta | None:
+        last = item.get("lastMessage") or {}
+        created = parse_datetime(
+            last.get("creationTime") or item.get("lastActivityTime")
+        )
+        return None if created is None else datetime.now(timezone.utc) - created
+
+    def is_nudge_candidate(self, item: dict[str, Any]) -> bool:
+        last = item.get("lastMessage") or {}
+        if str(last.get("participantId")) != str(item.get("currentParticipantId")):
+            return False
+        if not (last.get("text") or "").strip():
+            return False
+        if (last.get("workflowTransition") or {}).get("applicantState") == "DISCARD":
+            return False
+        return bool((item.get("resources") or {}).get("VACANCY"))
+
+    def nudge_chat(self, item: dict[str, Any]) -> None:
+        chat_id = int(item["id"])
+        counts = self._nudged()
+        if counts.get(str(chat_id), 0) >= MAX_NUDGES:
+            return
+        data = self._get(
+            "/chatik/api/chat_data",
+            {"chatId": chat_id},
+            f"{self.chatik_url}/chat/{chat_id}",
+        )
+        chat_data = data.get("chat") or {}
+        if "DISABLED" in ((chat_data.get("writePossibility") or {}).get("name") or ""):
+            return
+        messages = (chat_data.get("messages") or {}).get("items") or []
+        if any(m.get("type") == "PARTICIPANT_LEFT" for m in messages[-3:]):
+            return
+        text = self.args.nudge_text
+        if self.args.dry_run:
+            print(f"🔔 Напомнил бы в чате {chat_id} (тест, не отправлено): {text}")
+            return
+        self.send_message(chat_id, text)
+        counts[str(chat_id)] = counts.get(str(chat_id), 0) + 1
+        self._save_nudged(counts)
+        logger.info("Напоминание в чате %s", chat_id)
+        print(f"🔔 Напомнил о себе в чате {chat_id}", flush=True)
+
+    @cached_property
+    def _nudged_path(self) -> Path:
+        return self.tool.config_path / NUDGED_FILENAME
+
+    def _nudged(self) -> dict[str, int]:
+        try:
+            return json.loads(self._nudged_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def _save_nudged(self, counts: dict[str, int]) -> None:
+        counts = dict(list(counts.items())[-500:])
+        tmp = self._nudged_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(counts), encoding="utf-8")
+        tmp.replace(self._nudged_path)
 
     # ------------------------------------------------------------ chatik API
 
@@ -434,6 +566,9 @@ class Operation(BaseOperation):
         if self.is_handled(chat.chat_id, last.get("id")):
             # Уже разобрали это сообщение (ждёт владельца / ответ не нужен)
             return
+        if self.is_human_still_typing(chat, last):
+            logger.debug("Чат %s: даём владельцу время ответить самому", chat.chat_id)
+            return
         repeats = sum(1 for m in messages if m.get("text") == last.get("text"))
         if repeats >= MAX_SAME_QUESTION:
             logger.warning(
@@ -484,6 +619,20 @@ class Operation(BaseOperation):
         self.send_message(chat.chat_id, reply)
         logger.info("Ответ в чате %s (%s): %s", chat.chat_id, chat.author, reply)
         self.print_event(chat, reply, needs_human, sent=True)
+
+    def is_human_still_typing(self, chat: ChatToReply, last: dict[str, Any]) -> bool:
+        """Живому работодателю отвечаем не сразу: владелец может успеть сам.
+
+        Боту-рекрутеру отвечаем сразу. Сообщение не помечается разобранным,
+        поэтому на следующей проверке к нему вернёмся.
+        """
+        delay = getattr(self.args, "human_delay", HUMAN_REPLY_DELAY_MINUTES)
+        if chat.author_is_bot or not delay:
+            return False
+        created = parse_datetime(last.get("creationTime"))
+        return created is not None and datetime.now(timezone.utc) - created < timedelta(
+            minutes=delay
+        )
 
     def send_message(self, chat_id: int, text: str) -> None:
         self._post(
@@ -681,6 +830,13 @@ def pick_option(reply: str, options: list[str]) -> str:
         # «Да, есть. Проектировал…» → «да»
         if re.match(rf"{re.escape(option.strip().lower())}\b", normalized):
             return option
+    # Модель часто слегка переписывает кнопку: ищем самую похожую
+    lowered = {o.strip().lower(): o for o in options}
+    close = difflib.get_close_matches(
+        normalized, list(lowered), n=1, cutoff=FUZZY_CUTOFF
+    )
+    if close:
+        return lowered[close[0]]
     positive = [o for o in options if re.match(r"(да|есть|готов|yes)\b", o.strip().lower())]
     return (positive or options)[0]
 

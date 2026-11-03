@@ -6,6 +6,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from threading import Event
 from unittest.mock import MagicMock
 
 from hh_applicant_tool.operations.autoresponder import Operation
@@ -373,3 +374,97 @@ def test_polite_rejection_is_not_an_interview(capsys):
     )
     out = capsys.readouterr().out
     assert out.count("🎯") == 1 and "Чат: 26" in out
+
+
+def test_pick_option_matches_slightly_rewritten_button():
+    from hh_applicant_tool.operations.autoresponder import pick_option
+
+    options = ["Да, готов выйти в течение месяца", "Нет, не готов"]
+    assert pick_option("Да готов выйти в течении месяца", options) == options[0]
+    assert pick_option("нет не готов!", options) == options[1]
+
+
+def _chat_with_last_message(op, *, hours_ago=None, minutes_ago=None, is_bot=False):
+    created = datetime.now(timezone.utc) - timedelta(
+        hours=hours_ago or 0, minutes=minutes_ago or 0
+    )
+    op._get = MagicMock(return_value={"chat": {
+        "currentParticipantId": ME,
+        "writePossibility": {"name": "ENABLED"},
+        "messages": {"items": [
+            {"id": 9, "participantId": EMPLOYER, "text": "Когда удобно созвониться?",
+             "creationTime": created.isoformat(),
+             "participantDisplay": {"name": "Анна HR", "isBot": is_bot}},
+        ]},
+    }})
+    op._post = MagicMock(return_value={})
+    ai = MagicMock()
+    ai.complete.return_value = "Завтра после 14:00 удобно."
+    op.tool.get_cover_letter_ai.return_value = ai
+    op.tool.api_client.get.return_value = RESUMES[1]
+    return op.parse_chat_item(
+        chat_item(7, is_bot=is_bot), VACANCIES, {"283740897": RESUMES[1]}, RESUMES[0]
+    )
+
+
+def test_fresh_message_from_human_waits_for_the_owner():
+    op = make_operation(human_delay=15)
+    chat = _chat_with_last_message(op, minutes_ago=3)
+
+    op.reply_to_chat(chat)
+
+    op._post.assert_not_called()
+    assert not op.is_handled(7, 9)  # к сообщению вернёмся на следующей проверке
+
+
+def test_old_message_from_human_and_any_bot_message_are_answered():
+    op = make_operation(human_delay=15)
+    op.reply_to_chat(_chat_with_last_message(op, minutes_ago=20))
+    assert op._post.call_count == 1
+
+    op = make_operation(human_delay=15)
+    op.reply_to_chat(_chat_with_last_message(op, minutes_ago=1, is_bot=True))
+    assert op._post.call_count == 1
+
+
+def _my_last_item(chat_id, days_ago):
+    item = chat_item(chat_id, author=ME, text="Здравствуйте!", hours_ago=days_ago * 24)
+    return item
+
+
+def test_nudge_silent_chat_sends_message_up_to_the_limit():
+    op = make_operation(nudge_days=3, nudge_text="Актуальна ли вакансия?")
+    op._get = MagicMock(side_effect=lambda path, params, referer: (
+        {"chats": {"items": [_my_last_item(1, 4), _my_last_item(2, 1),
+                             _my_last_item(3, 40)], "nextFrom": None},
+         "resources": {"vacancies": VACANCIES}}
+        if path == "/chatik/api/chats"
+        else {"chat": {"writePossibility": {"name": "ENABLED"}, "messages": {"items": []}}}
+    ))
+    op._post = MagicMock(return_value={})
+
+    op.nudge_silent_chats(Event())
+
+    # Чат 2 слишком свежий, чат 3 слишком старый
+    assert op._post.call_count == 1
+    assert op._post.call_args.args[1]["chatId"] == 1
+    assert op._post.call_args.args[1]["text"] == "Актуальна ли вакансия?"
+
+    for _ in range(5):
+        op.nudge_silent_chats(Event())
+    assert op._post.call_count == 3  # MAX_NUDGES на чат
+
+
+def test_nudge_skips_chats_where_employer_wrote_last_or_rejected():
+    op = make_operation(nudge_days=3, nudge_text="?")
+    op._get = MagicMock(return_value={
+        "chats": {"items": [chat_item(1, hours_ago=100),
+                            chat_item(2, author=ME, hours_ago=100, state="DISCARD")],
+                  "nextFrom": None},
+        "resources": {"vacancies": VACANCIES},
+    })
+    op._post = MagicMock()
+
+    op.nudge_silent_chats(Event())
+
+    op._post.assert_not_called()

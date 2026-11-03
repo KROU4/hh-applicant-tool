@@ -1445,6 +1445,9 @@ class Operation(BaseOperation):
                             logger.error(f"Ошибка отправки письма: {ex}")
             except VacancyCaptcha as ex:
                 logger.warning("hh запросил капчу: %s", ex)
+                if self._solve_captcha_with_ai(ex.captcha_url):
+                    # Эта вакансия вернётся в работу при следующем прогоне
+                    continue
                 self._prepare_captcha(ex.captcha_url)
                 print(
                     "⏸ hh запросил капчу — ставлю отклики на паузу, "
@@ -1930,6 +1933,16 @@ class Operation(BaseOperation):
                 fp.write(f"{time.time():.0f}\n")
         except (OSError, TypeError, AttributeError) as ex:
             logger.debug("Не удалось записать время отклика: %s", ex)
+
+    def _solve_captcha_with_ai(self, captcha_url: str | None) -> bool:
+        """Капча через OpenRouter; False — дальше капчу решает владелец."""
+        if not captcha_url:
+            return False
+        try:
+            return hhcaptcha.solve_with_ai(self.tool, captcha_url)
+        except Exception as ex:
+            logger.warning("Автоматическое решение капчи не удалось: %s", ex)
+            return False
 
     def _prepare_captcha(self, captcha_url: str | None) -> None:
         """Картинка капчи для владельца: её пришлёт Telegram-бот."""

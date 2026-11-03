@@ -59,3 +59,16 @@ def test_device_user_agent_is_generated_once_per_profile(tmp_path):
     assert make_tool()._device_user_agent() == first
     saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
     assert saved["user_agent"] == first and saved["token"] == {"access_token": "t"}
+
+
+def test_api_key_is_optional_only_for_local_models():
+    from hh_applicant_tool.ai.openai import ChatOpenAI
+    from hh_applicant_tool.main import _is_local_url
+
+    assert _is_local_url("http://localhost:11434/v1/chat/completions")
+    assert _is_local_url("http://127.0.0.1:8080/v1/chat/completions")
+    assert not _is_local_url("https://api.openai.com/v1/chat/completions")
+    assert not _is_local_url(None)
+
+    client = ChatOpenAI(api_key="", base_url="http://localhost:11434/v1", model="m")
+    assert "Authorization" not in client._default_headers()

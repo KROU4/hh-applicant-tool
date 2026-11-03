@@ -83,3 +83,45 @@ def test_redirect_back_to_captcha_means_wrong_answer(tmp_path):
     hhcaptcha.prepare(tool, CAPTCHA_URL)
     assert not hhcaptcha.submit(tool, "неверно")
     assert hhcaptcha.load_pending(tmp_path) is not None
+
+
+def test_solve_with_ai_retries_after_wrong_answer(tmp_path):
+    tool, posts = make_tool(tmp_path)
+    # Первый ответ — редирект обратно на капчу, второй принят
+    answers = iter([("/captcha", 302), ("/", 302)])
+
+    def post(url, params=None, headers=None, allow_redirects=True):
+        posts.append((url, params))
+        if url == "https://hh.ru/captcha":
+            return SimpleNamespace(
+                raise_for_status=lambda: None, json=lambda: {"key": f"key-{len(posts)}"}
+            )
+        location, status = next(answers)
+        return SimpleNamespace(status_code=status, headers={"Location": location})
+
+    tool.session.post.side_effect = post
+    ai = MagicMock()
+    ai.solve_captcha.side_effect = ["abc12", "x y9"]
+    tool.get_captcha_ai = lambda: ai
+
+    assert hhcaptcha.solve_with_ai(tool, CAPTCHA_URL, pause=(0, 0)) is True
+    assert ai.solve_captcha.call_count == 2
+    submitted = [p["captchaText"] for u, p in posts if u.endswith("/account/captcha")]
+    assert submitted == ["abc12", "xy9"]
+    assert hhcaptcha.load_pending(tmp_path) is None
+
+
+def test_solve_with_ai_gives_up_without_ai_or_after_attempts(tmp_path):
+    tool, _ = make_tool(tmp_path, location="/captcha")
+
+    def no_ai():
+        raise ValueError("нет ключа")
+
+    tool.get_captcha_ai = no_ai
+    assert hhcaptcha.solve_with_ai(tool, CAPTCHA_URL, pause=(0, 0)) is False
+
+    ai = MagicMock()
+    ai.solve_captcha.return_value = "zzz"
+    tool.get_captcha_ai = lambda: ai
+    assert hhcaptcha.solve_with_ai(tool, CAPTCHA_URL, attempts=2, pause=(0, 0)) is False
+    assert ai.solve_captcha.call_count == 2

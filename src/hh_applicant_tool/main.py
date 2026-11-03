@@ -47,6 +47,12 @@ logger = logging.getLogger(__package__)
 OPERATIONS = "operations"
 
 
+def _is_local_url(url: str | None) -> bool:
+    from urllib.parse import urlparse
+
+    return bool(url) and urlparse(url).hostname in ("localhost", "127.0.0.1", "::1")
+
+
 class Error(Exception):
     pass
 
@@ -454,12 +460,13 @@ class HHApplicantTool(MegaTool):
             )
 
         api_key = c.get("api_key")
-        if not api_key:
+        base_url = c.get("base_url")
+        # Локальным моделям (Ollama, llama.cpp) ключ не нужен
+        if not api_key and not _is_local_url(base_url):
             raise ValueError(
                 f"API-ключ не задан. Укажите 'api_key' в секции '{config_section}' конфигурации."
             )
 
-        base_url = c.get("base_url")
         if not base_url:
             raise ValueError(
                 f"Параметр 'base_url' обязателен для AI-конфигурации в секции '{config_section}'. "

@@ -54,6 +54,8 @@ class ChatOpenAI:
         self._lock = Lock()
 
     def _default_headers(self) -> dict[str, str]:
+        if not self.api_key:
+            return {}
         return {
             "Authorization": f"Bearer {self.api_key}",
         }

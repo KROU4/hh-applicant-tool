@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -143,4 +144,43 @@ def submit(tool: HHApplicantTool, answer: str) -> bool:
         clear(tool.config_path)
         return True
     new_image(tool, info)
+    return False
+
+
+def solve_with_ai(
+    tool: HHApplicantTool,
+    captcha_url: str,
+    attempts: int = 3,
+    pause: tuple[float, float] = (2.0, 5.0),
+) -> bool:
+    """Решает капчу vision-моделью (OpenRouter) без участия человека.
+
+    Между распознаванием и отправкой пауза, как при ручном вводе. False —
+    модель не настроена или не справилась: капчу решит владелец в Telegram,
+    картинка к этому моменту уже лежит в каталоге профиля.
+    """
+    try:
+        ai = tool.get_captcha_ai()
+    except Exception as ex:
+        logger.debug("AI для капчи не настроен: %s", ex)
+        return False
+    prepare(tool, captcha_url)
+    for attempt in range(1, attempts + 1):
+        info = load_pending(tool.config_path)
+        if not info:
+            return False
+        try:
+            answer = ai.solve_captcha(image_path(tool.config_path).read_bytes())
+        except Exception as ex:
+            logger.warning("AI не смог прочитать капчу: %s", ex)
+            return False
+        answer = "".join(answer.split())
+        if not answer:
+            new_image(tool, info)
+            continue
+        time.sleep(random.uniform(*pause))
+        if submit(tool, answer):
+            logger.info("Капча решена моделью с попытки %d", attempt)
+            return True
+        logger.info("Капча: ответ модели %r неверный (попытка %d)", answer, attempt)
     return False
