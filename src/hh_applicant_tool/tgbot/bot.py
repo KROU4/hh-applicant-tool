@@ -101,6 +101,7 @@ WEB_LOGIN_TIMEOUT = 30 * 60
 WEB_LOGIN_DONE_MARK = "🎉"
 # apply-vacancies: сайт hh.ru разлогинил сессию, вакансии с тестом пропущены
 WEB_AUTH_EXPIRED_MARKER = "🔑 Сессия сайта hh.ru истекла"
+TESTS_SKIPPED_RE = re.compile(r"пропущено вакансий с тестом:\s*(\d+)")
 AUTORESPONDER_RESTART_EVERY = 6 * 3600
 AUTORESPONDER_BACKOFF = 10 * 60
 REFRESH_TOKEN_EVERY = 20 * 3600
@@ -170,7 +171,12 @@ INPUT_PROMPTS = {
     "<code>llm|rag|genai|ai[- ]?engineer|ai-инженер|агент</code>\n"
     "Бот откликается только на вакансии, где есть совпадение в названии или описании. "
     "Если «🔍 Поиск» пуст, запрос для hh соберётся из этих слов автоматически. «-» — очистить.",
-    "excluded_filter": "🚫 Пришлите стоп-слова через | (регулярное выражение), например:\n<code>junior|стажир|bitrix|1с|php</code>\n«-» — очистить.",
+    "excluded_filter": "🚫 Пришлите стоп-слова через | (регулярное выражение), например:\n<code>junior|стажир|bitrix|1с|php</code>\n"
+    "Слова ищутся в названии и компании; в условиях вида <code>^(?!.*ai).*аналитик</code> "
+    "«.*» видит только название. «-» — очистить.",
+    "priority_filter": "⭐ Пришлите главные слова через | (регулярное выражение), например:\n"
+    "<code>llm|\\bai\\b|\\bml\\b|ии-|агент</code>\n"
+    "Вакансии с ними в названии бот берёт первыми из всех источников, остальные — потом. «-» — очистить.",
     "max_responses": "🔢 Сколько откликов максимум за один запуск? Число, «-» — без лимита.",
     "system_prompt": "📝 Пришлите инструкцию для AI-писем (системный промпт).\nНапример: <i>Пиши кратко, по делу, упоминай опыт с Django</i>.\n«-» — вернуть стандартную.",
     "letter": "✉️ Пришлите шаблон письма (используется, когда AI-письма выключены).\n"
@@ -309,6 +315,10 @@ def build_apply_args(settings: dict[str, Any], letter_path: Path) -> list[str]:
     if settings.get("excluded_filter"):
         args.append(
             f"--excluded-filter={normalize_keywords(settings['excluded_filter'])}"
+        )
+    if settings.get("priority_filter"):
+        args.append(
+            f"--priority-filter={normalize_keywords(settings['priority_filter'])}"
         )
     if settings.get("max_responses"):
         args += ["--max-responses", str(settings["max_responses"])]
@@ -737,6 +747,7 @@ class HHBot:
             f"🌐 Другие страны: {OTHER_AREAS_TITLES.get(s.get('other_areas') or 'all')}",
             f"   запрос в hh: <code>{esc(s['search'] or regex_to_query(s.get('included_filter') or '') or '—')}</code>",
             f"🚫 Стоп-слова: {esc(s['excluded_filter']) or '—'}",
+            f"⭐ Главные слова (первыми): {esc(s.get('priority_filter') or '—')}",
             f"📄 Резюме: {esc(s['resume_title'] or 'все опубликованные')}",
             f"🌍 Формат работы: {WORK_FORMAT_TITLES.get(s['work_format'], s['work_format'])}",
             f"💼 Опыт: {EXPERIENCE_TITLES.get(s['experience'], s['experience'])}",
@@ -757,6 +768,7 @@ class HHBot:
                 button("🎯 Ключевые слова", "input:included_filter"),
                 button("🚫 Стоп-слова", "input:excluded_filter"),
             ],
+            [button("⭐ Главные слова", "input:priority_filter")],
             [
                 button("🔍 Поиск", "input:search"),
                 button(
@@ -1242,8 +1254,15 @@ class HHBot:
 
     def apply_input(self, key: str, text: str) -> str:
         clear = text in ("-", "—")
-        if key in ("search", "excluded_filter", "included_filter", "system_prompt", "letter_contact"):
-            if key in ("excluded_filter", "included_filter") and not clear:
+        if key in (
+            "search",
+            "excluded_filter",
+            "included_filter",
+            "priority_filter",
+            "system_prompt",
+            "letter_contact",
+        ):
+            if key in ("excluded_filter", "included_filter", "priority_filter") and not clear:
                 text = normalize_keywords(text)
                 try:
                     re.compile(text)
@@ -1587,9 +1606,13 @@ class HHBot:
         rows = [[button("📜 Полный лог", f"log:{task.name}"), button("🏠 Меню", "screen:main")]]
         web_auth_expired = task.name == "apply" and WEB_AUTH_EXPIRED_MARKER in log
         if web_auth_expired:
+            skipped = max((int(n) for n in TESTS_SKIPPED_RE.findall(log)), default=0)
             text += (
-                "\n\n🔑 Сайт hh.ru разлогинил бота: вакансии с тестом пропущены. "
-                "Войдите заново по коду — займёт минуту."
+                "\n\n🔑 <b>Сайт hh.ru разлогинил бота.</b> Подходящие вакансии с "
+                "тестом пропускаются"
+                + (f" (в этот раз — {skipped})" if skipped else "")
+                + ", а без входа на сайт hh заметно чаще просит капчу. Войдите "
+                "заново по коду — займёт минуту."
             )
             rows.insert(0, [button("🔑 Войти по коду", "weblogin:start")])
         self.notify(

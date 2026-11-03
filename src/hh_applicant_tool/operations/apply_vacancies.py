@@ -168,6 +168,7 @@ class Namespace(BaseNamespace):
     total_pages: int
     excluded_filter: str | None
     included_filter: str | None
+    priority_filter: str | None
     recommended_first: bool
     priority_area: list[str] | None
     other_areas: str
@@ -191,11 +192,15 @@ class Operation(BaseOperation):
     _last_apply_at: float | None = None
     # Сайт hh.ru разлогинил сессию — вакансии с тестом не отправить
     _web_auth_expired: bool = False
+    # Подходящие вакансии с тестом, пропущенные из-за этого за запуск (id)
+    _tests_skipped: frozenset[str] | set[str] = frozenset()
     captcha_paused: bool = False
     # Контакт в конце AI-письма (например, ссылка на Telegram)
     letter_contact: str = ""
     # Регулярка ключевых слов: без совпадения вакансия пропускается
     included_filter: str | None = None
+    # Вакансии с совпадением в названии идут раньше остальных
+    priority_filter: str | None = None
 
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument("--resume-id", help="Идентефикатор резюме")
@@ -305,6 +310,11 @@ class Operation(BaseOperation):
             "--included-filter",
             type=str,
             help=r"Откликаться только на вакансии, где в названии или описании есть совпадение с шаблоном. Например, `--included-filter 'llm|rag|ai[- ]?engineer|genai'`",
+        )
+        parser.add_argument(
+            "--priority-filter",
+            type=str,
+            help=r"Вакансии, в названии которых есть совпадение с шаблоном, обрабатываются раньше остальных из всех источников. Например, `--priority-filter 'llm|\bai\b|\bml\b|агент'`",
         )
         parser.add_argument(
             "--max-responses",
@@ -468,6 +478,14 @@ class Operation(BaseOperation):
         self.excluded_employer_id = args.excluded_employer_id
         self.excluded_filter = args.excluded_filter
         self.included_filter = args.included_filter
+        self.priority_filter = args.priority_filter
+        if self.priority_filter:
+            try:
+                re.compile(self.priority_filter)
+            except re.error as ex:
+                # До анализа резюме через AI, а не посреди прогона
+                logger.error("Некорректный --priority-filter: %s", ex)
+                return 1
         self.recommended_first = bool(args.recommended_first)
         self.priority_area = args.priority_area
         self.other_areas = args.other_areas
@@ -1064,21 +1082,27 @@ class Operation(BaseOperation):
                     )
                     continue
 
-                if vacancy.get("has_test") and (
-                    self.args.skip_tests or self._web_auth_expired
-                ):
-                    logger.debug(
-                        "Пропускаю вакансию с тестом %s",
-                        vacancy["alternate_url"],
-                    )
-                    continue
-
                 if redirect_url := vacancy.get("response_url"):
                     logger.debug(
                         "Пропускаем вакансию %s с перенаправлением: %s",
                         vacancy["alternate_url"],
                         redirect_url,
                     )
+                    continue
+
+                skip_test = bool(vacancy.get("has_test")) and (
+                    self.args.skip_tests or self._web_auth_expired
+                )
+                title_only = "name" in (getattr(self, "search_field", None) or [])
+                if skip_test and not title_only:
+                    # Фильтры по описанию открывали бы вакансию целиком — лишний
+                    # просмотр и шаг к капче ради вакансии, которую всё равно
+                    # пропустим
+                    logger.debug(
+                        "Пропускаю вакансию с тестом %s",
+                        vacancy["alternate_url"],
+                    )
+                    self._count_skipped_test(vacancy, resume["id"])
                     continue
 
                 if not self._is_included(vacancy):
@@ -1108,6 +1132,16 @@ class Operation(BaseOperation):
                         "Вакансия добавлена в черный список: %s",
                         vacancy["alternate_url"],
                     )
+                    continue
+
+                # При поиске по названию фильтры дешёвые — после них в счёт
+                # пропущенных из-за сайта идут только подходящие вакансии
+                if skip_test:
+                    logger.debug(
+                        "Пропускаю вакансию с тестом %s",
+                        vacancy["alternate_url"],
+                    )
+                    self._count_skipped_test(vacancy, resume["id"])
                     continue
 
                 # AI фильтрация вакансий
@@ -1334,6 +1368,7 @@ class Operation(BaseOperation):
                             # Тест решается через сайт, а сайт нас разлогинил:
                             # остальные вакансии с тестом в этом прогоне не трогаем
                             self._web_auth_expired = True
+                            self._note_test_skipped(vacancy_id)
                             print(WEB_AUTH_EXPIRED_MARKER, "— вакансии с тестом пропускаю")
                         continue
 
@@ -1449,6 +1484,12 @@ class Operation(BaseOperation):
         print(
             f"✅️ Закончили рассылку для резюме: {resume['title']}. Отправлено: {applied_count}"
         )
+        if self._tests_skipped:
+            # Итог за весь запуск (разные вакансии), бот берёт последний/max
+            print(
+                f"{WEB_AUTH_EXPIRED_MARKER} — пропущено вакансий с тестом: "
+                f"{len(self._tests_skipped)}"
+            )
         self.total_applied += applied_count
         return limit_reached
 
@@ -1736,6 +1777,29 @@ class Operation(BaseOperation):
     def _get_vacancies(
         self, resume_id: str | None = None
     ) -> Iterator[SearchVacancy]:
+        vacancies = self._source_vacancies(resume_id)
+        if not self.priority_filter:
+            yield from vacancies
+            return
+        # Сначала главные вакансии из всех источников, потом остальные. За
+        # день hh даёт отправить лишь несколько откликов до капчи, и они не
+        # должны уходить на «Python-разработчика», пока ждёт «LLM Engineer»
+        pattern = re.compile(self.priority_filter, re.IGNORECASE)
+        cancel = getattr(self, "_cancel_event", None)
+        rest: list[SearchVacancy] = []
+        for vacancy in vacancies:
+            if cancel is not None and cancel.is_set():
+                # Пока копятся «остальные», цикл откликов не видит отмену
+                return
+            if pattern.search(vacancy.get("name") or ""):
+                yield vacancy
+            else:
+                rest.append(vacancy)
+        yield from rest
+
+    def _source_vacancies(
+        self, resume_id: str | None = None
+    ) -> Iterator[SearchVacancy]:
         similar = f"/resumes/{resume_id}/similar_vacancies"
         if not self.search:
             yield from self._paginate(similar, {})
@@ -1793,6 +1857,24 @@ class Operation(BaseOperation):
 
             if page >= res["pages"] - 1:
                 return
+
+    def _count_skipped_test(self, vacancy: SearchVacancy, resume_id: str) -> None:
+        """Вакансия с тестом не отправлена из-за слетевшей сессии сайта.
+
+        Не считаем те, на которые отклика не было бы и с живой сессией:
+        hh уже отверг отклик или AI-фильтр раньше отклонил вакансию.
+        """
+        if not self._web_auth_expired:
+            return
+        if self._apply_failed_before(vacancy, resume_id):
+            return
+        if self.ai_filter and self._is_vacancy_already_skipped(vacancy, resume_id):
+            return
+        self._note_test_skipped(vacancy["id"])
+
+    def _note_test_skipped(self, vacancy_id: str) -> None:
+        # Своё множество у каждого запуска, а не общее у класса
+        self._tests_skipped = {*self._tests_skipped, vacancy_id}
 
     def _pace_apply(self) -> bool:
         """Откликаемся не чаще раза в apply_interval (письмо пишется в счёт паузы).
@@ -1939,8 +2021,11 @@ class Operation(BaseOperation):
         if "name" in (getattr(self, "search_field", None) or []):
             # Ищем по названию — и стоп-слова смотрим в названии и компании:
             # в описаниях «Java», «junior», «Сбер» встречаются мимоходом
-            # («будете менторить junior») и отсекали подходящие вакансии
-            title = " ".join(
+            # («будете менторить junior») и отсекали подходящие вакансии.
+            # Компания — отдельной строкой: условия вида «^(?!…AI…).*аналитик»
+            # смотрят только на название, а «.» не переходит на строку компании
+            # (её «…Продажи B2B, маркетинг» не должны отсекать разработчика)
+            title = "\n".join(
                 filter(
                     None,
                     [vacancy.get("name"), (vacancy.get("employer") or {}).get("name")],
