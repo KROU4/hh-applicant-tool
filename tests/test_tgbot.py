@@ -486,6 +486,22 @@ def test_keywords_drive_search_and_filter(bot, tmp_path):
     assert HHApplicantTool()._parser.parse_args(args).search == "python"
 
 
+def test_priority_words_reach_apply(bot, tmp_path):
+    from hh_applicant_tool.main import HHApplicantTool
+
+    args = build_apply_args(bot.state.get("apply"), tmp_path / "letter.txt")
+    assert HHApplicantTool()._parser.parse_args(args).priority_filter is None
+
+    bot.handle_update(callback("input:priority_filter"))
+    bot.handle_update(message(r"llm|\bml\b|c++"))
+    assert bot.state.get("apply", "priority_filter") == r"llm|\bml\b|c\+\+"
+    args = build_apply_args(bot.state.get("apply"), tmp_path / "letter.txt")
+    assert HHApplicantTool()._parser.parse_args(args).priority_filter == r"llm|\bml\b|c\+\+"
+
+    text, _ = bot.screen_settings()
+    assert "Главные слова" in text
+
+
 def test_dry_run_report_sends_each_letter(bot):
     log = (
         "🚀 Начинаю рассылку откликов для резюме: Senior AI Engineer\n"
@@ -885,14 +901,15 @@ def test_web_login_flow_with_captcha_and_code(bot):
 def test_apply_report_offers_login_when_site_session_expired(bot):
     (bot.runner.logs_dir / "apply.log").write_text(
         "📨 Отправили отклик на вакансию https://hh.ru/vacancy/1\n"
-        "🔑 Сессия сайта hh.ru истекла — вакансии с тестом пропускаю\n",
+        "🔑 Сессия сайта hh.ru истекла — вакансии с тестом пропускаю\n"
+        "🔑 Сессия сайта hh.ru истекла — пропущено вакансий с тестом: 7\n",
         encoding="utf-8",
     )
     task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies"])
     task.proc.alive = False
     bot._on_task_finish(task, 0)
     _, text, markup = bot.api.sent[-1]
-    assert "разлогинил" in text
+    assert "разлогинил" in text and "в этот раз — 7" in text
     assert markup["inline_keyboard"][0][0]["callback_data"] == "weblogin:start"
 
 

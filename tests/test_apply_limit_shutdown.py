@@ -405,6 +405,23 @@ def test_title_search_ignores_keywords_in_snippet():
     assert op._is_included({**_make_vacancy(2), "name": "ML-инженер"})
 
 
+def test_title_conditions_do_not_see_company_name():
+    op = _make_operation(max_responses=0)
+    op.search_field = ["name"]
+    op.excluded_filter = r"сбер|^(?!(?=.*engineer)(?=.*\bai\b)).*(маркетинг|аналитик)"
+
+    def vacancy(name, employer):
+        return {**_make_vacancy(1), "name": name, "employer": {"name": employer}}
+
+    # «маркетинг» в названии компании не отсекает разработчика
+    assert not op._is_excluded(vacancy("Python Developer", "Продажи B2B, маркетинг"))
+    # а в названии вакансии без AI-инженерии — отсекает
+    assert op._is_excluded(vacancy("Маркетинг-менеджер", "Ромашка"))
+    assert not op._is_excluded(vacancy("AI Engineer (маркетинг)", "Ромашка"))
+    # Простые стоп-слова по-прежнему ловят и компанию
+    assert op._is_excluded(vacancy("Python Developer", "СберТех"))
+
+
 def test_page_load_survives_connection_drop(monkeypatch):
     import requests
 
@@ -508,4 +525,69 @@ def test_expired_site_session_skips_remaining_test_vacancies(capsys):
     # Сайт разлогинил один раз — остальные с тестом не трогаем, обычная ушла
     assert op._solve_vacancy_test.call_count == 1
     assert op.tool.api_client.post.call_count == 1
-    assert capsys.readouterr().out.count("Сессия сайта hh.ru истекла") == 1
+    out = capsys.readouterr().out
+    assert out.count("вакансии с тестом пропускаю") == 1
+    # В итоге прогона — сколько подходящих вакансий с тестом не отправлено
+    assert "пропущено вакансий с тестом: 3" in out
+
+
+def test_expired_session_counts_only_suitable_test_vacancies(capsys):
+    op = _make_operation(max_responses=0)
+    op._web_auth_expired = True
+    op.excluded_filter = "smm"
+    op.search_field = ["name"]
+    op._solve_vacancy_test = MagicMock()
+    vacancies = [
+        {**_make_vacancy(1), "name": "LLM Engineer", "has_test": True},
+        {**_make_vacancy(2), "name": "SMM AI-креатор", "has_test": True},
+    ]
+    op._get_vacancies = lambda resume_id=None: iter(vacancies)
+    resume = {"id": "r1", "title": "Dev", "alternate_url": "u"}
+    user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+    op._apply_resume(resume=resume, user=user, seen_employers=set())
+    assert not op._solve_vacancy_test.called
+    # Стоп-слово отсеяло SMM раньше, чем дошло до теста
+    saved = op.tool.storage.skipped_vacancies.save.call_args.args[0]
+    assert saved["vacancy_id"] == "2" and saved["reason"] == "excluded_filter"
+    assert "пропущено вакансий с тестом: 1" in capsys.readouterr().out
+
+
+def test_priority_titles_go_first_from_all_sources():
+    op = _make_operation(max_responses=0)
+    op.search = "python OR llm"
+    op.area = None
+    op.recommended_first = True
+    op.priority_area = ["16"]
+    op.other_areas = "remote"
+    op.total_pages = 1
+    op.priority_filter = r"llm|\bml\b"
+    pages = {
+        "similar": ["Python-разработчик", "LLM Engineer"],
+        "area": ["Backend Python", "ML Engineer"],
+        "remote": ["Fullstack Python", "Senior LLM-инженер", "LLM Engineer"],
+    }
+
+    def api_get(url, params, *a, **k):
+        key = "similar" if "similar" in url else "area" if params.get("area") else "remote"
+        items = [
+            {"id": "LLM Engineer" if name == "LLM Engineer" else f"{key}-{i}", "name": name}
+            for i, name in enumerate(pages[key])
+        ]
+        return {"items": items, "found": len(items), "pages": 1}
+
+    op.tool.api_client.get.side_effect = api_get
+    op._get_search_params = lambda page: {"page": page, "text": op.search}
+    names = [v["name"] for v in op._get_vacancies(resume_id="r1")]
+    # Главные — в порядке источников и без повторов, затем остальные
+    assert names == [
+        "LLM Engineer",
+        "ML Engineer",
+        "Senior LLM-инженер",
+        "Python-разработчик",
+        "Backend Python",
+        "Fullstack Python",
+    ]
+
+    op.priority_filter = None
+    names = [v["name"] for v in op._get_vacancies(resume_id="r1")]
+    assert names[:2] == ["Python-разработчик", "LLM Engineer"]
