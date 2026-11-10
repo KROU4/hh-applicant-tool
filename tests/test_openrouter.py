@@ -257,14 +257,14 @@ def test_empty_openai_section_key_does_not_hide_openrouter(tmp_path):
 def test_captcha_consensus_takes_majority():
     session = FakeSession(
         {
-            "a": [ok("заядлое скрыля")],
-            "b": [ok("белое сияние")],
-            "c": [ok("Заядлое Скрыля")],
+            "a:free": [ok("заядлое скрыля")],
+            "b:free": [ok("белое сияние")],
+            "c:free": [ok("Заядлое Скрыля")],
         }
     )
     client = ChatOpenRouter(
         "key",
-        vision_models=["a", "b", "c"],
+        vision_models=["a:free", "b:free", "c:free"],
         session=session,
         rate_limit=0,
         max_wait=0,
@@ -276,19 +276,32 @@ def test_captcha_consensus_takes_majority():
 def test_captcha_consensus_survives_errors_and_strips_prefix():
     session = FakeSession(
         {
-            "a": [err(429, "busy")],
-            "b": [ok("Текст: шеин умолкая")],
+            "a:free": [err(429, "busy")],
+            "b:free": [ok("Текст: шеин умолкая")],
         }
     )
     client = ChatOpenRouter(
         "key",
-        vision_models=["a", "b"],
+        vision_models=["a:free", "b:free"],
         session=session,
         rate_limit=0,
         max_wait=0,
         captcha_votes=2,
     )
     assert client.solve_captcha_consensus(b"png") == "шеин умолкая"
+
+
+def test_captcha_consensus_ignores_paid_models():
+    session = FakeSession({"paid/model": [ok("платная")]})
+    client = ChatOpenRouter(
+        "key",
+        vision_models=["paid/model"],
+        session=session,
+        rate_limit=0,
+        max_wait=0,
+    )
+    with pytest.raises(OpenRouterError, match="бесплатных"):
+        client.solve_captcha_consensus(b"png")
 
 
 def test_captcha_normalize_keeps_two_words():

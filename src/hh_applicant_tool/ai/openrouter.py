@@ -41,14 +41,7 @@ DEFAULT_TEXT_MODELS: tuple[str, ...] = (
 )
 
 DEFAULT_VISION_MODELS: tuple[str, ...] = (
-    # Платные, но дешёвые: на таком искажённом тексте заметно точнее
-    "google/gemini-2.5-flash-lite",
-    "qwen/qwen3-vl-235b-a22b-instruct",
-    "openai/gpt-4o-mini",
-    "google/gemini-2.5-flash",
-    "anthropic/claude-haiku-4.5",
-    "openai/gpt-4.1-mini",
-    # Бесплатные как запас
+    # Только бесплатные модели: платное распознавание идёт через CapSolver
     "qwen/qwen3.8-27b:free",
     "google/gemma-4-31b-it:free",
     "google/gemma-4-26b-a4b-it:free",
@@ -478,13 +471,8 @@ class ChatOpenRouter(ChatOpenAI):
         return " ".join(words[-2:]).lower() if len(words) > 2 else " ".join(words).lower()
 
     def solve_captcha(self, image_data: bytes) -> str:
-        text = self._chat(
-            self._captcha_messages(image_data),
-            vision=True,
-            max_tokens=30,
-            temperature=0.0,
-        )
-        return self._normalize_captcha(text)
+        # Капчу всегда спрашиваем у нескольких бесплатных моделей
+        return self.solve_captcha_consensus(image_data)
 
     def solve_captcha_consensus(self, image_data: bytes) -> str:
         """Спрашивает несколько моделей и возвращает самый частый ответ.
@@ -496,7 +484,14 @@ class ChatOpenRouter(ChatOpenAI):
         from collections import Counter
 
         messages = self._captcha_messages(image_data)
-        candidates = self._candidates(vision=True)[: max(self.captcha_votes, 1)]
+        # Только бесплатные модели: платный вариант — CapSolver
+        candidates = [
+            m
+            for m in self._candidates(vision=True)
+            if m.endswith(":free")
+        ][: max(self.captcha_votes, 1)]
+        if not candidates:
+            raise OpenRouterError("Нет доступных бесплатных vision-моделей")
         answers: list[str] = []
         for model in candidates:
             try:
