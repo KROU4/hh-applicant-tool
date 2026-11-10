@@ -182,22 +182,40 @@ def solve_with_ai(
         pause = (float(low), float(high))
 
     prepare(tool, captcha_url)
-    for attempt in range(1, attempts + 1):
-        info = load_pending(tool.config_path)
-        if not info:
-            return False
-        try:
-            answer = solve_image_text(
-                tool, image_path(tool.config_path).read_bytes(), captcha_url
+    # Сначала все попытки бесплатной модели, затем платный CapSolver: неверный
+    # ответ одной модели не должен отменять другого решателя. После каждой
+    # ошибки hh уже выдал новую картинку — её и показывает следующий решатель.
+    for provider in providers:
+        for attempt in range(1, attempts + 1):
+            info = load_pending(tool.config_path)
+            if not info:
+                return False
+            try:
+                raw = _solve_provider(
+                    tool,
+                    provider,
+                    image_path(tool.config_path).read_bytes(),
+                    captcha_url,
+                )
+            except Exception as ex:
+                logger.warning("Решатель %s: %s", provider, ex)
+                break
+            answer = " ".join(raw.split())
+            if not answer:
+                new_image(tool, info)
+                continue
+            time.sleep(random.uniform(*pause))
+            if submit(tool, answer):
+                logger.info(
+                    "Капча решена (%s) с попытки %d", provider, attempt
+                )
+                return True
+            logger.info(
+                "Капча (%s): ответ %r неверный (попытка %d)",
+                provider,
+                answer,
+                attempt,
             )
-        except Exception as ex:
-            logger.warning("Капчу автоматически решить не удалось: %s", ex)
-            return False
-        time.sleep(random.uniform(*pause))
-        if submit(tool, answer):
-            logger.info("Капча решена с попытки %d", attempt)
-            return True
-        logger.info("Капча: ответ %r неверный (попытка %d)", answer, attempt)
     return False
 
 
@@ -251,7 +269,10 @@ def _solve_provider(
     tool: HHApplicantTool, provider: str, image: bytes, captcha_url: str
 ) -> str:
     if provider == "openrouter":
-        return tool.get_captcha_ai().solve_captcha(image)
+        ai = tool.get_captcha_ai()
+        if hasattr(type(ai), "solve_captcha_consensus"):
+            return ai.solve_captcha_consensus(image)
+        return ai.solve_captcha(image)
 
     conf = tool.config.get("capsolver") or {}
     return capsolver.solve_image(

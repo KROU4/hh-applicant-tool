@@ -41,6 +41,14 @@ DEFAULT_TEXT_MODELS: tuple[str, ...] = (
 )
 
 DEFAULT_VISION_MODELS: tuple[str, ...] = (
+    # Платные, но дешёвые: на таком искажённом тексте заметно точнее
+    "google/gemini-2.5-flash-lite",
+    "qwen/qwen3-vl-235b-a22b-instruct",
+    "openai/gpt-4o-mini",
+    "google/gemini-2.5-flash",
+    "anthropic/claude-haiku-4.5",
+    "openai/gpt-4.1-mini",
+    # Бесплатные как запас
     "qwen/qwen3.8-27b:free",
     "google/gemma-4-31b-it:free",
     "google/gemma-4-26b-a4b-it:free",
@@ -123,6 +131,8 @@ class ChatOpenRouter(ChatOpenAI):
     # У бесплатных моделей OpenRouter лимит 20 запросов в минуту
     rate_limit: int = 20
     timeout: float = 90.0
+    # Сколько vision-моделей спрашивать и сравнивать ответы
+    captcha_votes: int = 3
 
     def _default_headers(self) -> dict[str, str]:
         return {
@@ -425,12 +435,18 @@ class ChatOpenRouter(ChatOpenAI):
             temperature=self.temperature,
         )
 
-    def solve_captcha(self, image_data: bytes) -> str:
+    def _captcha_messages(self, image_data: bytes) -> list[dict[str, Any]]:
         image_base64 = base64.b64encode(image_data).decode("utf-8")
-        messages = [
+        return [
             {
                 "role": "system",
-                "content": "Ты должен распознать текст на изображении. Верни ТОЛЬКО текст, без каких-либо объяснений или дополнительных символов.",
+                "content": (
+                    "На картинке искажённый текст на русском: одно или несколько "
+                    "слов, часто по дуге, повёрнуто или под наклоном. Если слов "
+                    "два, верни ОБА по порядку слева направо, даже если одно "
+                    "читается хуже. Верни ТОЛЬКО распознанный текст, слова "
+                    "через пробел."
+                ),
             },
             {
                 "role": "user",
@@ -443,15 +459,65 @@ class ChatOpenRouter(ChatOpenAI):
                     },
                     {
                         "type": "text",
-                        "text": "Распознай текст на изображении. Верни только результат распознавания (текст на изображении).",
+                        "text": "Распознай текст. Верни только текст с картинки, слова через пробел.",
                     },
                 ],
             },
         ]
-        text = self._chat(messages, vision=True, max_tokens=20, temperature=0.0)
-        # Модели иногда отвечают «Текст: abc12» — берём последнее слово
-        words = text.strip().split()
-        return words[-1] if words else ""
+
+    @staticmethod
+    def _normalize_captcha(text: str | None) -> str:
+        # Модели любят «Текст: abc12» — срезаем подпись, берём последние слова
+        text = re.sub(
+            r"^(?:текст|ответ|result|text|капча)\s*[:：\-]\s*",
+            "",
+            (text or "").strip().strip("\"'«»"),
+            flags=re.I,
+        )
+        words = text.split()
+        return " ".join(words[-2:]).lower() if len(words) > 2 else " ".join(words).lower()
+
+    def solve_captcha(self, image_data: bytes) -> str:
+        text = self._chat(
+            self._captcha_messages(image_data),
+            vision=True,
+            max_tokens=30,
+            temperature=0.0,
+        )
+        return self._normalize_captcha(text)
+
+    def solve_captcha_consensus(self, image_data: bytes) -> str:
+        """Спрашивает несколько моделей и возвращает самый частый ответ.
+
+        Одна модель часто теряет одно из двух слов, поэтому ответы сравниваются
+        по большинству. Если все модели разные — берётся самый длинный (в нём
+        обычно больше слов), при равенстве — первый.
+        """
+        from collections import Counter
+
+        messages = self._captcha_messages(image_data)
+        candidates = self._candidates(vision=True)[: max(self.captcha_votes, 1)]
+        answers: list[str] = []
+        for model in candidates:
+            try:
+                result = self._try_model(
+                    model, messages, max_tokens=30, temperature=0.0
+                )
+            except Exception as ex:
+                logger.debug("Капча: модель %s не ответила: %s", model, ex)
+                continue
+            if result.text:
+                answer = self._normalize_captcha(result.text)
+                if answer:
+                    answers.append(answer)
+        if not answers:
+            raise OpenRouterError("Ни одна модель не прочитала капчу")
+
+        answer, count = Counter(answers).most_common(1)[0]
+        if count == 1:
+            answer = max(answers, key=lambda a: (len(a.split()), len(a)))
+        logger.info("Капча: голоса моделей %r, выбран %r", answers, answer)
+        return answer
 
 
 def _is_transient(message: str) -> bool:

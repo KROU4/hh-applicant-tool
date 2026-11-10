@@ -568,6 +568,7 @@ class HHApplicantTool(MegaTool):
                 "rate_limit",
                 "temperature",
                 "max_completion_tokens",
+                "captcha_votes",
             )
             if c.get(key) is not None
         }

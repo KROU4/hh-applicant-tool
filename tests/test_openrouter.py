@@ -252,3 +252,46 @@ def test_empty_openai_section_key_does_not_hide_openrouter(tmp_path):
     assert isinstance(client, ChatOpenRouter)
     assert client.api_key == "sk-or-test"
     assert client.rate_limit == 20
+
+
+def test_captcha_consensus_takes_majority():
+    session = FakeSession(
+        {
+            "a": [ok("заядлое скрыля")],
+            "b": [ok("белое сияние")],
+            "c": [ok("Заядлое Скрыля")],
+        }
+    )
+    client = ChatOpenRouter(
+        "key",
+        vision_models=["a", "b", "c"],
+        session=session,
+        rate_limit=0,
+        max_wait=0,
+        captcha_votes=3,
+    )
+    assert client.solve_captcha_consensus(b"png") == "заядлое скрыля"
+
+
+def test_captcha_consensus_survives_errors_and_strips_prefix():
+    session = FakeSession(
+        {
+            "a": [err(429, "busy")],
+            "b": [ok("Текст: шеин умолкая")],
+        }
+    )
+    client = ChatOpenRouter(
+        "key",
+        vision_models=["a", "b"],
+        session=session,
+        rate_limit=0,
+        max_wait=0,
+        captcha_votes=2,
+    )
+    assert client.solve_captcha_consensus(b"png") == "шеин умолкая"
+
+
+def test_captcha_normalize_keeps_two_words():
+    assert ChatOpenRouter._normalize_captcha("  Текст: ЛИЦЕВЫМ НЯНЧИТЕ \n") == (
+        "лицевым нянчите"
+    )
