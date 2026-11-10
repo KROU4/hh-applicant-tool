@@ -397,6 +397,24 @@ def test_telegram_falls_back_to_plain_text():
     assert len(session.calls[-1]["text"]) <= 4096
 
 
+def test_captcha_without_image_sends_link(bot):
+    log = (
+        "WARNING hh запросил капчу: Captcha required: "
+        "https://hh.ru/account/captcha?state=abc\n"
+    )
+    bot._captcha_fallback(log)
+    text = bot.api.sent[-1][1]
+    assert "https://hh.ru/account/captcha?state=abc" in text
+
+
+def test_captcha_fallback_silent_when_image_exists(bot):
+    from hh_applicant_tool.utils import hhcaptcha
+
+    hhcaptcha.image_path(bot.config_path).write_bytes(b"PNG")
+    bot._captcha_fallback("hh запросил капчу: https://hh.ru/account/captcha")
+    assert bot.api.sent == []
+
+
 def test_redact_hides_bot_token():
     from hh_applicant_tool.tgbot.telegram import redact
 
@@ -722,8 +740,7 @@ def test_captcha_pause_retries_in_an_hour(bot):
     before = time.time()
     bot._on_task_finish(task, 3)
     assert bot.state.last_run("apply_next") == pytest.approx(before + 3600, abs=5)
-    text = bot.api.sent[-1][1]
-    assert "пауза — hh попросил капчу" in text
+    text = next(t for _, t, _ in bot.api.sent if "пауза — hh попросил капчу" in t)
     assert "Отправлено откликов: <b>1</b>" in text
 
 

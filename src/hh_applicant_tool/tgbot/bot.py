@@ -142,6 +142,8 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 APPLIED_RE = re.compile(r"Отправлено:\s*(\d+)")
 SENT_RE = re.compile(r"^📨 Отправили отклик", re.M)
 HH_LIMIT_MARKER = "Лимит откликов hh.ru исчерпан"
+# Ссылка на капчу из лога — нужна, если картинку получить не удалось
+CAPTCHA_URL_RE = re.compile(r"(https://hh\.ru/\S*captcha\S*)")
 # Блоки тестовых откликов из вывода apply-vacancies --dry-run
 DRY_RUN_RE = re.compile(r"(🧪 Тест: .*?)\n=== конец ===", re.S)
 DRY_RUN_LIMIT = 5
@@ -1622,6 +1624,20 @@ class HHBot:
         )
         if captcha:
             self.ask_captcha()
+            self._captcha_fallback(log)
+
+    def _captcha_fallback(self, log: str) -> None:
+        """Картинку получить не удалось — даём ссылку, чтобы решить в браузере."""
+        image = hhcaptcha.image_path(self.config_path)
+        if image.exists():
+            return
+        matches = CAPTCHA_URL_RE.findall(log)
+        url = matches[-1] if matches else "https://hh.ru/account/captcha"
+        self.notify(
+            "🔐 hh просит капчу, но картинку получить не удалось.\n"
+            f"Откройте {url} в браузере, решите её и нажмите «Продолжить».",
+            markup=keyboard([[button("▶️ Продолжить", "run:apply")]]),
+        )
 
     # ---------------------------------------------------------------- captcha
 

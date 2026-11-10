@@ -36,8 +36,16 @@ class CapSolverError(Exception):
     pass
 
 
-def _request(url: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
-    response = requests.post(url, json=payload, timeout=timeout)
+def _request(
+    url: str,
+    payload: dict[str, Any],
+    timeout: float,
+    proxy_url: str | None = None,
+) -> dict[str, Any]:
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    response = requests.post(
+        url, json=payload, timeout=timeout, proxies=proxies
+    )
     try:
         data = response.json()
     except ValueError as ex:
@@ -66,6 +74,7 @@ def solve_image(
     timeout: float = 60.0,
     poll_interval: float = 1.0,
     max_retries: int = 3,
+    proxy_url: str | None = None,
 ) -> str:
     """Возвращает текст с картинки.
 
@@ -88,7 +97,7 @@ def solve_image(
     last_error = "нет ответа"
     for attempt in range(1, max_retries + 1):
         try:
-            data = _request(CREATE_TASK_URL, payload, timeout)
+            data = _request(CREATE_TASK_URL, payload, timeout, proxy_url)
         except (requests.RequestException, CapSolverError) as ex:
             last_error = str(ex)
             logger.warning(
@@ -119,6 +128,7 @@ def solve_image(
                     GET_TASK_RESULT_URL,
                     {"clientKey": api_key, "taskId": task_id},
                     timeout,
+                    proxy_url,
                 )
                 _raise_for_error(result)
                 if result.get("status") == "ready":

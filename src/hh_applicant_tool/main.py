@@ -184,6 +184,8 @@ class HHApplicantTool(MegaTool):
 
     def __init__(self):
         self._parser = self._create_parser()
+        # Сколько капч уже решено автоматически в этом процессе
+        self._captcha_auto_count = 0
 
     @staticmethod
     def _proxy_url_to_dict(proxy_url: str | None) -> dict[str, str]:
@@ -319,11 +321,21 @@ class HHApplicantTool(MegaTool):
 
     def handle_captcha(self, captcha_url: str) -> bool:
         """Пробует решить капчу автоматически (OpenRouter, затем CapSolver)."""
+        captcha_config = self.config.get("captcha") or {}
+        limit = int(captcha_config.get("max_auto") or 10)
+        if self._captcha_auto_count >= limit:
+            logger.info(
+                "Автоматически решено %d капч за прогон — дальше решает человек",
+                self._captcha_auto_count,
+            )
+            return False
         try:
-            return hhcaptcha.solve_with_ai(self, captcha_url)
+            solved = hhcaptcha.solve_with_ai(self, captcha_url)
         except Exception as ex:
             logger.warning("Автоматическое решение капчи не удалось: %s", ex)
             return False
+        self._captcha_auto_count += 1
+        return solved
 
     def _device_user_agent(self) -> str:
         """Одно «устройство» на профиль.

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import time
 from pathlib import Path
@@ -260,5 +261,20 @@ def _solve_provider(
         module=conf.get("module") or "common",
         timeout=float(conf.get("timeout") or 60.0),
         max_retries=int(conf.get("max_retries") or 3),
+        proxy_url=_proxy_url(tool),
+    )
+
+
+def _proxy_url(tool: HHApplicantTool) -> str | None:
+    """Прокси для CapSolver: свой из конфига или общий из окружения."""
+    if url := tool.config.get("capsolver", {}).get("proxy_url"):
+        return url
+    if url := tool.config.get("proxy_url"):
+        return url
+    return (
+        os.getenv("HTTPS_PROXY")
+        or os.getenv("https_proxy")
+        or os.getenv("HTTP_PROXY")
+        or os.getenv("http_proxy")
     )
 

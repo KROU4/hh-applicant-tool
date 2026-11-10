@@ -132,7 +132,7 @@ class BaseClient:
                         headers=self._default_headers(),
                         allow_redirects=False,
                     )
-                except requests.ConnectionError as ex:
+                except (requests.ConnectionError, requests.Timeout) as ex:
                     last_exc = ex
                     response = None
                     logger.warning(
