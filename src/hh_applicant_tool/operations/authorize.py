@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import random
 import re
 import typing
 from datetime import datetime
@@ -241,6 +242,19 @@ class Operation(BaseOperation):
             return digits[1:]
         return digits
 
+    async def _type(self, locator, text: str) -> None:
+        """Печатает текст с задержкой между символами, как человек."""
+        try:
+            await locator.press_sequentially(
+                text, delay=random.uniform(60, 140), timeout=self.selector_timeout
+            )
+        except Exception:
+            await locator.fill(text)
+
+    @staticmethod
+    async def _human_pause(low: float, high: float) -> None:
+        await asyncio.sleep(random.uniform(low, high))
+
     async def _fill_username(self, page, username: str) -> None:
         await page.wait_for_selector(
             ", ".join(
@@ -253,22 +267,24 @@ class Operation(BaseOperation):
             ),
             timeout=self.selector_timeout,
         )
+        await self._human_pause(1.0, 2.5)
 
         if "@" in username:
             email_tab = page.locator(self.SEL_EMAIL_TAB)
             if await email_tab.count():
                 await email_tab.first.click(force=True)
+                await self._human_pause(0.3, 0.8)
             email_input = page.locator(self.SEL_EMAIL_INPUT)
             if await email_input.count():
-                await email_input.first.fill(username)
+                await self._type(email_input.first, username)
                 return
 
         phone_input = page.locator(self.SEL_PHONE_INPUT)
         if await phone_input.count() and "@" not in username:
-            await phone_input.first.fill(self._national_phone(username))
+            await self._type(phone_input.first, self._national_phone(username))
             return
 
-        await page.fill(self.SEL_LOGIN_INPUT, username)
+        await self._type(page.locator(self.SEL_LOGIN_INPUT).first, username)
 
     async def _direct_login(self, page, password: str) -> None:
         logger.info("Вход по паролю...")
@@ -277,8 +293,11 @@ class Operation(BaseOperation):
         await page.wait_for_selector(
             self.SEL_PASSWORD_INPUT, timeout=self.selector_timeout
         )
-        await page.locator(self.SEL_PASSWORD_INPUT).first.fill(password)
-        await page.locator(self.SEL_PASSWORD_INPUT).first.press("Enter")
+        await self._human_pause(0.5, 1.3)
+        password_input = page.locator(self.SEL_PASSWORD_INPUT).first
+        await self._type(password_input, password)
+        await self._human_pause(0.8, 2.0)
+        await password_input.press("Enter")
         logger.debug("Форма с паролем отправлена")
 
     async def _onetime_code_login(self, page) -> None:
@@ -291,7 +310,6 @@ class Operation(BaseOperation):
         await page.wait_for_selector(
             self.SEL_CODE_CONTAINER, timeout=self.selector_timeout
         )
-
         print("Код был отправлен. Проверьте почту или SMS.")
         code = (
             await asyncio.to_thread(input, "Введите полученный код: ")
@@ -331,6 +349,7 @@ class Operation(BaseOperation):
             await asyncio.to_thread(input, "Введите текст с картинки: ")
         ).strip()
         await page.fill(self.SEL_CAPTCHA_INPUT, captcha_text)
+        await self._human_pause(0.7, 1.8)
         await page.press(self.SEL_CAPTCHA_INPUT, "Enter")
         logger.debug("Капча отправлена")
 

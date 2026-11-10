@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from ..main import BaseNamespace, BaseOperation
+from ..utils import hhcaptcha
 
 if TYPE_CHECKING:
     from ..main import HHApplicantTool
@@ -327,9 +328,29 @@ class Operation(BaseOperation):
 
         if captcha_state := (res.get("hhcaptcha") or {}).get("captchaState"):
             pending = {**pending, "stage": "captcha", "captcha_state": captcha_state}
-            pending["captcha_key"] = self._captcha_image(redirect_url)
+            key = self._captcha_image(redirect_url)
+            pending["captcha_key"] = key
             self._save(pending)
             print("🔐 hh просит капчу перед отправкой кода")
+            if captcha is None and (self.tool.config.get("captcha") or {}).get(
+                "auto", True
+            ):
+                try:
+                    text = hhcaptcha.solve_image_text(
+                        self.tool, image_path(self.tool.config_path).read_bytes(), redirect_url
+                    )
+                except Exception as ex:
+                    logger.warning("Автоматически решить капчу входа не удалось: %s", ex)
+                else:
+                    print(f"🤖 Капча решена автоматически: {text}")
+                    return self._send_otp(
+                        pending,
+                        {
+                            "captchaState": captcha_state,
+                            "captchaText": text,
+                            "captchaKey": key,
+                        },
+                    )
             return WRONG_CAPTCHA_EXIT_CODE if captcha else CAPTCHA_EXIT_CODE
 
         if res.get("success"):

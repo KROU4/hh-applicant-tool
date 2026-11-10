@@ -1383,7 +1383,7 @@ class Operation(BaseOperation):
                             res = self.api_client.post(
                                 "/negotiations",
                                 params,
-                                delay=random.uniform(1, 3),
+                                delay=random.uniform(2, 5),
                             )
                             assert res == {}
                             applied_count += 1
@@ -1935,11 +1935,11 @@ class Operation(BaseOperation):
             logger.debug("Не удалось записать время отклика: %s", ex)
 
     def _solve_captcha_with_ai(self, captcha_url: str | None) -> bool:
-        """Капча через OpenRouter; False — дальше капчу решает владелец."""
+        """Капча автоматически (OpenRouter, CapSolver); False — решает владелец."""
         if not captcha_url:
             return False
         try:
-            return hhcaptcha.solve_with_ai(self.tool, captcha_url)
+            return bool(self.tool.handle_captcha(captcha_url))
         except Exception as ex:
             logger.warning("Автоматическое решение капчи не удалось: %s", ex)
             return False

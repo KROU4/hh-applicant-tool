@@ -273,6 +273,7 @@ class TestCaptchaPause:
 
         op = _make_operation(max_responses=0)
         op.included_filter = r"llm"
+        op.tool.handle_captcha.return_value = False
 
         def api_get(url, *a, **k):
             if url == "/vacancies/2":

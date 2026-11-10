@@ -31,6 +31,10 @@ def make_tool(tmp_path, *, submit_status=302, location="/"):
         session=session,
         config_path=tmp_path,
         xsrf_token="x",
+        config={
+            "openrouter": {"api_key": "sk-or-test"},
+            "captcha": {"solve_delay": [0, 0]},
+        },
         parse_redirect_config=lambda page, check_auth=True: {
             "hhcaptcha": {"captchaState": "STATE"},
             "captchaAccountState": {"backurl": "/", "failurl": CAPTCHA_URL},
@@ -107,7 +111,7 @@ def test_solve_with_ai_retries_after_wrong_answer(tmp_path):
     assert hhcaptcha.solve_with_ai(tool, CAPTCHA_URL, pause=(0, 0)) is True
     assert ai.solve_captcha.call_count == 2
     submitted = [p["captchaText"] for u, p in posts if u.endswith("/account/captcha")]
-    assert submitted == ["abc12", "xy9"]
+    assert submitted == ["abc12", "x y9"]
     assert hhcaptcha.load_pending(tmp_path) is None
 
 
@@ -125,3 +129,29 @@ def test_solve_with_ai_gives_up_without_ai_or_after_attempts(tmp_path):
     tool.get_captcha_ai = lambda: ai
     assert hhcaptcha.solve_with_ai(tool, CAPTCHA_URL, attempts=2, pause=(0, 0)) is False
     assert ai.solve_captcha.call_count == 2
+
+
+def test_solve_uses_capsolver_after_openrouter_failure(tmp_path):
+    tool, _ = make_tool(tmp_path, location="/")
+    tool.config["capsolver"] = {"api_key": "CAP-test"}
+    ai = MagicMock()
+    ai.solve_captcha.side_effect = ValueError("модель недоступна")
+    tool.get_captcha_ai = lambda: ai
+
+    capsolver = MagicMock()
+    capsolver.solve_image.return_value = "верный ответ"
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(hhcaptcha, "capsolver", capsolver)
+    try:
+        assert hhcaptcha.solve_with_ai(tool, CAPTCHA_URL, pause=(0, 0)) is True
+    finally:
+        monkeypatch.undo()
+    capsolver.solve_image.assert_called_once()
+
+
+def test_solve_skips_unconfigured_providers(tmp_path):
+    tool, _ = make_tool(tmp_path)
+    tool.config = {}
+    tool.get_captcha_ai = MagicMock()
+    assert hhcaptcha.solve_with_ai(tool, CAPTCHA_URL, pause=(0, 0)) is False
+    tool.get_captcha_ai.assert_not_called()

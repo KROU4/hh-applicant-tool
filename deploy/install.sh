@@ -2,7 +2,7 @@
 # Установка/обновление бота на сервере без Docker и без Playwright.
 # Ожидает исходники в /opt/hh-applicant-tool/app (например, распакованный git archive).
 #
-#   TELEGRAM_BOT_TOKEN=... OPENROUTER_API_KEY=... bash install.sh
+#   TELEGRAM_BOT_TOKEN=... OPENROUTER_API_KEY=... CAPSOLVER_API_KEY=... bash install.sh
 #
 # Токены нужны только при первой установке: они записываются в config.json.
 set -euo pipefail
@@ -32,6 +32,8 @@ if os.environ.get("TELEGRAM_BOT_TOKEN"):
     config.setdefault("telegram_bot", {})["token"] = os.environ["TELEGRAM_BOT_TOKEN"]
 if os.environ.get("OPENROUTER_API_KEY"):
     config.setdefault("openrouter", {})["api_key"] = os.environ["OPENROUTER_API_KEY"]
+if os.environ.get("CAPSOLVER_API_KEY"):
+    config.setdefault("capsolver", {})["api_key"] = os.environ["CAPSOLVER_API_KEY"]
 path.write_text(json.dumps(config, indent=2, ensure_ascii=False))
 EOF
 

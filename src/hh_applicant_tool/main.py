@@ -38,6 +38,7 @@ from .constants import (
     LOG_FILENAME,
 )
 from .storage import StorageFacade
+from .utils import hhcaptcha
 from .utils.cookiejar import HHOnlyCookieJar
 from .utils.log import setup_logger
 from .utils.mixins import MegaTool
@@ -78,6 +79,7 @@ class BaseNamespace(argparse.Namespace):
     openai_proxy_url: str
     openai_timeout: float
     openai_connect_timeout: float
+    captcha_auto: bool | None
     operation_run: Callable[[HHApplicantTool, BaseNamespace], None | int] | None
 
 
@@ -154,6 +156,13 @@ class HHApplicantTool(MegaTool):
             type=float,
             help="Таймаут соединения с OpenAI в секундах",
         )
+        parser.add_argument(
+            "--captcha-auto",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Автоматически решать капчу (OpenRouter, CapSolver). "
+            "С --no-captcha-auto капча сразу уходит человеку",
+        )
         subparsers = parser.add_subparsers(help="commands")
         package_dir = Path(__file__).resolve().parent / OPERATIONS
         for _, module_name, _ in iter_modules([str(package_dir)]):
@@ -222,7 +231,12 @@ class HHApplicantTool(MegaTool):
             logger.info("Use proxies for %s: %r", log_label, proxies)
             session.proxies = proxies
 
-        session.headers.update({"User-Agent": DESKTOP_USER_AGENT})
+        session.headers.update(
+            {
+                "User-Agent": DESKTOP_USER_AGENT,
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            }
+        )
         return session
 
     @cached_property
@@ -284,6 +298,12 @@ class HHApplicantTool(MegaTool):
     def api_client(self) -> api.client.ApiClient:
         config = self.config
         token = config.get("token", {})
+        captcha_config = config.get("captcha") or {}
+        auto = (
+            self.captcha_auto
+            if self.captcha_auto is not None
+            else captcha_config.get("auto", True)
+        )
         return api.client.ApiClient(
             client_id=config.get("client_id"),
             client_secret=config.get("client_secret"),
@@ -293,7 +313,17 @@ class HHApplicantTool(MegaTool):
             delay=self.api_delay or config.get("api_delay"),
             user_agent=self.user_agent or self._device_user_agent(),
             session=self.session,
+            captcha_handler=self.handle_captcha if auto else None,
+            max_captcha_attempts=int(captcha_config.get("max_attempts") or 3),
         )
+
+    def handle_captcha(self, captcha_url: str) -> bool:
+        """Пробует решить капчу автоматически (OpenRouter, затем CapSolver)."""
+        try:
+            return hhcaptcha.solve_with_ai(self, captcha_url)
+        except Exception as ex:
+            logger.warning("Автоматическое решение капчи не удалось: %s", ex)
+            return False
 
     def _device_user_agent(self) -> str:
         """Одно «устройство» на профиль.

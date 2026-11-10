@@ -21,6 +21,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from . import capsolver
+
 if TYPE_CHECKING:
     from ..main import HHApplicantTool
 
@@ -29,6 +31,13 @@ logger = logging.getLogger(__package__)
 HH_URL = "https://hh.ru"
 PENDING_FILENAME = "captcha_pending.json"
 IMAGE_FILENAME = "captcha.png"
+
+# Порядок решателей по умолчанию: сначала бесплатная vision-модель, затем
+# платный CapSolver. Недоступные (без ключа) пропускаются.
+DEFAULT_PROVIDERS = ("openrouter", "capsolver")
+DEFAULT_ATTEMPTS = 3
+# Пауза перед отправкой ответа — как будто человек вводил текст руками
+DEFAULT_SOLVE_DELAY = (4.0, 9.0)
 
 
 class CaptchaError(Exception):
@@ -150,37 +159,106 @@ def submit(tool: HHApplicantTool, answer: str) -> bool:
 def solve_with_ai(
     tool: HHApplicantTool,
     captcha_url: str,
-    attempts: int = 3,
-    pause: tuple[float, float] = (2.0, 5.0),
+    attempts: int | None = None,
+    pause: tuple[float, float] | None = None,
 ) -> bool:
-    """Решает капчу vision-моделью (OpenRouter) без участия человека.
+    """Решает капчу автоматически и отправляет ответ.
 
-    Между распознаванием и отправкой пауза, как при ручном вводе. False —
-    модель не настроена или не справилась: капчу решит владелец в Telegram,
+    Решатели перебираются по порядку: vision-модель (OpenRouter), затем
+    CapSolver. Между распознаванием и отправкой пауза, как при ручном вводе.
+    False — ни один решатель не справился: капчу решит владелец в Telegram,
     картинка к этому моменту уже лежит в каталоге профиля.
     """
-    try:
-        ai = tool.get_captcha_ai()
-    except Exception as ex:
-        logger.debug("AI для капчи не настроен: %s", ex)
+    providers = _providers(tool)
+    if not providers:
+        logger.debug("Автоматические решатели капчи не настроены")
         return False
+
+    conf = tool.config.get("captcha") or {}
+    attempts = attempts or int(conf.get("attempts") or DEFAULT_ATTEMPTS)
+    if pause is None:
+        low, high = conf.get("solve_delay") or DEFAULT_SOLVE_DELAY
+        pause = (float(low), float(high))
+
     prepare(tool, captcha_url)
     for attempt in range(1, attempts + 1):
         info = load_pending(tool.config_path)
         if not info:
             return False
         try:
-            answer = ai.solve_captcha(image_path(tool.config_path).read_bytes())
+            answer = solve_image_text(
+                tool, image_path(tool.config_path).read_bytes(), captcha_url
+            )
         except Exception as ex:
-            logger.warning("AI не смог прочитать капчу: %s", ex)
+            logger.warning("Капчу автоматически решить не удалось: %s", ex)
             return False
-        answer = "".join(answer.split())
-        if not answer:
-            new_image(tool, info)
-            continue
         time.sleep(random.uniform(*pause))
         if submit(tool, answer):
-            logger.info("Капча решена моделью с попытки %d", attempt)
+            logger.info("Капча решена с попытки %d", attempt)
             return True
-        logger.info("Капча: ответ модели %r неверный (попытка %d)", answer, attempt)
+        logger.info("Капча: ответ %r неверный (попытка %d)", answer, attempt)
     return False
+
+
+def configured_providers(tool: HHApplicantTool) -> list[str]:
+    """Настроенные решатели в заданном порядке; без ключей — не берём."""
+    return _providers(tool)
+
+
+def _providers(tool: HHApplicantTool) -> list[str]:
+    """Настроенные решатели в заданном порядке; без ключей — не берём."""
+    conf = tool.config.get("captcha") or {}
+    configured = conf.get("providers") or DEFAULT_PROVIDERS
+    result = []
+    for provider in configured:
+        provider = str(provider).lower()
+        if provider == "openrouter" and _openrouter_key(tool):
+            result.append(provider)
+        elif provider == "capsolver" and (tool.config.get("capsolver") or {}).get(
+            "api_key"
+        ):
+            result.append(provider)
+    return result
+
+
+def _openrouter_key(tool: HHApplicantTool) -> str:
+    # Секция цели перекрывает общий ключ роутера
+    captcha_ai = tool.config.get("openai_captcha") or {}
+    if captcha_ai.get("api_key"):
+        return captcha_ai["api_key"]
+    return (tool.config.get("openrouter") or {}).get("api_key") or ""
+
+
+def solve_image_text(
+    tool: HHApplicantTool, image: bytes, captcha_url: str
+) -> str:
+    """Распознаёт картинку перебором настроенных решателей, без отправки."""
+    last_error = "решатели не настроены"
+    for provider in _providers(tool):
+        try:
+            raw = _solve_provider(tool, provider, image, captcha_url)
+        except Exception as ex:
+            logger.warning("Решатель %s: %s", provider, ex)
+            last_error = str(ex)
+            continue
+        if text := " ".join(raw.split()):
+            return text
+    raise CaptchaError(last_error)
+
+
+def _solve_provider(
+    tool: HHApplicantTool, provider: str, image: bytes, captcha_url: str
+) -> str:
+    if provider == "openrouter":
+        return tool.get_captcha_ai().solve_captcha(image)
+
+    conf = tool.config.get("capsolver") or {}
+    return capsolver.solve_image(
+        conf.get("api_key") or "",
+        image,
+        website_url=captcha_url,
+        module=conf.get("module") or "common",
+        timeout=float(conf.get("timeout") or 60.0),
+        max_retries=int(conf.get("max_retries") or 3),
+    )
+

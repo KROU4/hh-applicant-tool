@@ -3,15 +3,16 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import random
 import time
 from dataclasses import dataclass
 from functools import cached_property
 from threading import Lock
-from typing import Any, Literal, TypeVar
+from typing import Any, Callable, Literal, TypeVar
 from urllib.parse import urlencode, urljoin
 
 import requests
-from requests import Session
+from requests import Response, Session
 
 from hh_applicant_tool.api.user_agent import generate_android_useragent
 
@@ -27,6 +28,11 @@ __all__ = ("ApiClient", "OAuthClient")
 HH_API_URL = "https://api.hh.ru/"
 HH_OAUTH_URL = "https://hh.ru/oauth/"
 DEFAULT_DELAY = 0.345
+# Разброс паузы между запросами: 0.3 = ±15 %. Ровные интервалы выдают бота.
+DEFAULT_JITTER = 0.3
+MAX_RETRIES = 3
+RETRY_STATUSES = (429, 500, 502, 503, 504)
+MAX_BACKOFF = 30.0
 
 AllowedMethods = Literal["GET", "POST", "PUT", "DELETE"]
 T = TypeVar("T")
@@ -43,6 +49,8 @@ class BaseClient:
     user_agent: str | None = None
     session: Session | None = None
     delay: float | None = None
+    jitter: float = DEFAULT_JITTER
+    max_retries: int = MAX_RETRIES
     _previous_request_time: float = 0.0
 
     def __post_init__(self) -> None:
@@ -71,6 +79,17 @@ class BaseClient:
             "X-HH-App-Active": "true",
         }
 
+    def _retry_delay(self, attempt: int, response: Response | None) -> float:
+        """Пауза перед повтором: Retry-After сервера или экспонента с джиттером."""
+        retry_after = None
+        if response is not None:
+            try:
+                retry_after = float(response.headers.get("Retry-After") or 0)
+            except ValueError:
+                retry_after = None
+        base = retry_after or min(2.0**attempt, MAX_BACKOFF)
+        return base + random.uniform(0, max(base * 0.2, 0.5))
+
     def request(
         self,
         method: AllowedMethods,
@@ -85,54 +104,100 @@ class BaseClient:
         params = dict(params or {})
         params.update(kwargs)
         url = self.resolve_url(endpoint)
-        with self.lock:
-            # На серваке какая-то анти-DDOS система
-            if (
-                delay := (self.delay if delay is None else delay)
-                - time.monotonic()
-                + self._previous_request_time
-            ) > 0:
-                logger.debug("wait %fs before request", delay)
-                time.sleep(delay)
-            has_body = method in ["POST", "PUT"]
-            payload = {
-                ["data", "json"][as_json] if has_body else "params": params
-            }
-            # logger.debug(f"request info: {method = }, {url = }, {headers = }, params = {repr(params)[:255]}")
-            response = self.session.request(
-                method,
-                url,
-                **payload,
-                headers=self._default_headers(),
-                allow_redirects=False,
-            )
-            try:
-                # У этих лошков сервер не отдает Content-Length, а кривое API
-                # отдает пустые ответы, например, при отклике на вакансии,
-                # и мы не можем узнать содержит ли ответ тело
-                # 'Server': 'ddos-guard'
-                # ...
-                # 'Transfer-Encoding': 'chunked'
+        has_body = method in ["POST", "PUT"]
+        payload_key = ["data", "json"][as_json] if has_body else "params"
+
+        last_exc: Exception | None = None
+        for attempt in range(1, self.max_retries + 1):
+            with self.lock:
+                base_delay = self.delay if delay is None else delay
+                # Джиттер делает интервалы неодинаковыми, как у человека
+                if base_delay and self.jitter:
+                    base_delay *= random.uniform(
+                        1 - self.jitter / 2, 1 + self.jitter / 2
+                    )
+                # На серваке какая-то анти-DDOS система
+                if (
+                    wait := base_delay
+                    - time.monotonic()
+                    + self._previous_request_time
+                ) > 0:
+                    logger.debug("wait %fs before request", wait)
+                    time.sleep(wait)
                 try:
-                    rv = response.json() if response.text else {}
-                except json.JSONDecodeError as ex:
-                    raise errors.BadResponse(
-                        f"Can't decode JSON: {method} {url} ({response.status_code})"
-                    ) from ex
-            finally:
-                logger.debug(
-                    "%d %s %s with params: %.1000s",
-                    response.status_code,
-                    method,
-                    url,
-                    params or "-",
+                    response = self.session.request(
+                        method,
+                        url,
+                        **{payload_key: params},
+                        headers=self._default_headers(),
+                        allow_redirects=False,
+                    )
+                except requests.ConnectionError as ex:
+                    last_exc = ex
+                    response = None
+                    logger.warning(
+                        "(%d/%d) сбой соединения: %s %s: %s",
+                        attempt,
+                        self.max_retries,
+                        method,
+                        url,
+                        ex,
+                    )
+                finally:
+                    self._previous_request_time = time.monotonic()
+
+            if response is not None:
+                try:
+                    # У этих лошков сервер не отдает Content-Length, а кривое API
+                    # отдает пустые ответы, например, при отклике на вакансии,
+                    # и мы не можем узнать содержит ли ответ тело
+                    # 'Server': 'ddos-guard'
+                    # ...
+                    # 'Transfer-Encoding': 'chunked'
+                    try:
+                        rv = response.json() if response.text else {}
+                    except json.JSONDecodeError as ex:
+                        raise errors.BadResponse(
+                            f"Can't decode JSON: {method} {url} ({response.status_code})"
+                        ) from ex
+                finally:
+                    logger.debug(
+                        "%d %s %s with params: %.1000s",
+                        response.status_code,
+                        method,
+                        url,
+                        params or "-",
+                    )
+
+                # Перегрузка и временные сбои сервера — повторяем тем же
+                # запросом, выдерживая Retry-After, если он есть
+                if (
+                    response.status_code in RETRY_STATUSES
+                    and attempt < self.max_retries
+                ):
+                    wait = self._retry_delay(attempt, response)
+                    logger.warning(
+                        "HH ответил %d, повтор через %.1fс (%d/%d)",
+                        response.status_code,
+                        wait,
+                        attempt,
+                        self.max_retries,
+                    )
+                    time.sleep(wait)
+                    continue
+
+                errors.ApiError.raise_for_status(response, rv)
+                assert 300 > response.status_code >= 200, (
+                    f"Unexpected status code for {method} {url}: {response.status_code}"
                 )
-                self._previous_request_time = time.monotonic()
-        errors.ApiError.raise_for_status(response, rv)
-        assert 300 > response.status_code >= 200, (
-            f"Unexpected status code for {method} {url}: {response.status_code}"
-        )
-        return rv
+                return rv
+
+            # Сбой соединения — пауза и повтор
+            if attempt < self.max_retries:
+                time.sleep(self._retry_delay(attempt, None))
+
+        assert last_exc is not None
+        raise last_exc
 
     def get(self, *args, **kwargs) -> T:
         return self.request("GET", *args, **kwargs)
@@ -216,6 +281,13 @@ class ApiClient(BaseClient):
     client_id: str | None = None
     client_secret: str | None = None
     base_url: str = HH_API_URL
+    # Автоматическое решение капчи: callback получает URL капчи и возвращает,
+    # принял ли hh ответ. Пока True — запрос повторяется.
+    captcha_handler: Callable[[str], bool] | None = None
+    max_captcha_attempts: int = 3
+    _captcha_lock: Lock = dataclasses.field(
+        default_factory=Lock, init=False, repr=False
+    )
 
     @property
     def is_access_expired(self) -> bool:
@@ -255,17 +327,36 @@ class ApiClient(BaseClient):
                 self, method, endpoint, params, delay, as_json, **kwargs
             )
 
-        try:
-            return do_request()
-        # TODO: добавить класс для ошибок типа AccessTokenExpired
-        except errors.Forbidden as ex:
-            if not self.is_access_expired or not self.refresh_token:
-                raise ex
-            logger.info("try to refresh access_token")
-            # Пробуем обновить токен
-            self.refresh_access_token()
-            # И повторно отправляем запрос
-            return do_request()
+        captcha_tries = 0
+        while True:
+            try:
+                return do_request()
+            # Капчу пытаемся решить автоматически и повторить тот же запрос
+            except errors.CaptchaRequired as ex:
+                handler = self.captcha_handler
+                if not handler or not ex.captcha_url:
+                    raise
+                with self._captcha_lock:
+                    if captcha_tries >= self.max_captcha_attempts:
+                        raise
+                    captcha_tries += 1
+                    logger.info(
+                        "hh запросил капчу, попытка %d/%d",
+                        captcha_tries,
+                        self.max_captcha_attempts,
+                    )
+                    accepted = handler(ex.captcha_url)
+                if not accepted:
+                    raise
+            # TODO: добавить класс для ошибок типа AccessTokenExpired
+            except errors.Forbidden as ex:
+                if not self.is_access_expired or not self.refresh_token:
+                    raise ex
+                logger.info("try to refresh access_token")
+                # Пробуем обновить токен
+                self.refresh_access_token()
+                # И повторно отправляем запрос
+                return do_request()
 
     def handle_access_token(self, token: AccessToken) -> None:
         for field in ("access_token", "refresh_token", "access_expires_at"):
