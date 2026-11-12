@@ -149,6 +149,40 @@ def test_solve_uses_capsolver_after_openrouter_failure(tmp_path):
     capsolver.solve_image.assert_called_once()
 
 
+def test_solve_uses_capsolver_after_wrong_openrouter_answer(tmp_path):
+    tool, posts = make_tool(tmp_path)
+    tool.config["capsolver"] = {"api_key": "CAP-test"}
+    tool.config["captcha"]["attempts"] = 1
+    answers = iter([("/captcha", 403), ("/", 302)])
+
+    def post(url, params=None, headers=None, allow_redirects=True):
+        posts.append((url, params))
+        if url == "https://hh.ru/captcha":
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {"key": f"key-{len(posts)}"},
+            )
+        location, status = next(answers)
+        return SimpleNamespace(status_code=status, headers={"Location": location})
+
+    tool.session.post.side_effect = post
+    ai = MagicMock()
+    ai.solve_captcha.return_value = "неверно"
+    tool.get_captcha_ai = lambda: ai
+
+    capsolver = MagicMock()
+    capsolver.solve_image.return_value = "верный ответ"
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(hhcaptcha, "capsolver", capsolver)
+    try:
+        assert hhcaptcha.solve_with_ai(tool, CAPTCHA_URL, pause=(0, 0)) is True
+    finally:
+        monkeypatch.undo()
+    submitted = [p["captchaText"] for u, p in posts if u.endswith("/account/captcha")]
+    assert submitted == ["неверно", "верный ответ"]
+    capsolver.solve_image.assert_called_once()
+
+
 def test_solve_skips_unconfigured_providers(tmp_path):
     tool, _ = make_tool(tmp_path)
     tool.config = {}
