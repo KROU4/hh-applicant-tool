@@ -494,7 +494,13 @@ class HHApplicantTool(MegaTool):
             # model/base_url/rate_limit там настроены под другого провайдера
             overrides = {
                 k: c[k]
-                for k in ("models", "temperature", "max_completion_tokens")
+                for k in (
+                    "models",
+                    "vision_models",
+                    "captcha_votes",
+                    "temperature",
+                    "max_completion_tokens",
+                )
                 if c.get(k) not in (None, "", [])
             }
             return self._init_openrouter_client(

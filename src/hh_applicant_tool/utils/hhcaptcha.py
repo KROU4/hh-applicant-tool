@@ -33,10 +33,11 @@ HH_URL = "https://hh.ru"
 PENDING_FILENAME = "captcha_pending.json"
 IMAGE_FILENAME = "captcha.png"
 
-# Порядок решателей по умолчанию: сначала бесплатная vision-модель, затем
-# платный CapSolver. Недоступные (без ключа) пропускаются.
-DEFAULT_PROVIDERS = ("openrouter", "capsolver")
-DEFAULT_ATTEMPTS = 3
+# Порядок решателей по умолчанию: сначала vision-модель. CapSolver на капче
+# hh (два искажённых русских слова) отвечал латиницей и не решил ни одной
+# капчи, поэтому включается только явно в конфиге.
+DEFAULT_PROVIDERS = ("openrouter",)
+DEFAULT_ATTEMPTS = 2
 # Пауза перед отправкой ответа — как будто человек вводил текст руками
 DEFAULT_SOLVE_DELAY = (4.0, 9.0)
 
@@ -130,14 +131,22 @@ def submit(tool: HHApplicantTool, answer: str) -> bool:
     info = load_pending(tool.config_path)
     if not info or not info.get("key"):
         raise CaptchaError("Нет капчи, ожидающей ответа")
+    # Форму отправляем как браузер: состояние в query, поля в теле, включая
+    # `_xsrf` и `isBot`. С одними query-параметрами hh отвечал 403 даже на
+    # верный текст.
     response = tool.session.post(
         f"{HH_URL}/account/captcha",
         params={
-            "captchaText": answer.strip(),
-            "captchaKey": info["key"],
+            "state": info["captcha_state"],
             "captchaState": info["captcha_state"],
             "backurl": info["backurl"],
             "failurl": info["failurl"],
+        },
+        data={
+            "_xsrf": tool.xsrf_token,
+            "captchaText": answer.strip(),
+            "captchaKey": info["key"],
+            "isBot": "false",
         },
         headers=_headers(tool, info["captcha_url"]),
         allow_redirects=False,
@@ -153,8 +162,23 @@ def submit(tool: HHApplicantTool, answer: str) -> bool:
     if accepted:
         clear(tool.config_path)
         return True
+    # hh на неверный ответ присылает JSON с уже новой капчей — берём её
+    state = _error_state(response)
+    if state:
+        info = {**info, "captcha_state": state}
     new_image(tool, info)
     return False
+
+
+def _error_state(response: Any) -> str | None:
+    """Новое состояние капчи из ответа hh на неверный текст."""
+    try:
+        data = response.json()
+    except (AttributeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return (data.get("hhcaptcha") or {}).get("captchaState") or None
 
 
 def solve_with_ai(
@@ -182,7 +206,7 @@ def solve_with_ai(
         pause = (float(low), float(high))
 
     prepare(tool, captcha_url)
-    # Сначала все попытки бесплатной модели, затем платный CapSolver: неверный
+    # Сначала все попытки vision-модели, затем (если включён) CapSolver: неверный
     # ответ одной модели не должен отменять другого решателя. После каждой
     # ошибки hh уже выдал новую картинку — её и показывает следующий решатель.
     for provider in providers:

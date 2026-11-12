@@ -1560,8 +1560,11 @@ class HHBot:
         retry_note = ""
         streak = 0
         if task.name == "apply" and not dry_run and not task.stopped_by_user:
-            # Сколько прогонов подряд кончились капчей без ответа владельца
-            streak = int(self.state.last_run("captcha_streak")) + 1 if captcha else 0
+            # Сколько прогонов подряд кончились капчей без ответа владельца.
+            # Если капча была, но решена (картинки уже нет), серия сбрасывается:
+            # иначе автолимит 10 капч за прогон растягивал паузу до 8 часов.
+            unsolved = captcha and hhcaptcha.load_pending(self.config_path) is not None
+            streak = int(self.state.last_run("captcha_streak")) + 1 if unsolved else 0
             self.state.mark_run("captcha_streak", streak)
         if (
             task.name == "apply"

@@ -189,6 +189,9 @@ class Operation(BaseOperation):
     # Пауза между откликами, секунды. Около отклика в минуту hh через
     # 10–15 откликов закрывает отправку капчей
     apply_interval: tuple[float, float] = (150.0, 300.0)
+    # Пауза после решённой капчи перед повтором вакансии: hh снимает
+    # подозрительность не мгновенно
+    captcha_cooldown: tuple[float, float] = (45.0, 120.0)
     _last_apply_at: float | None = None
     # Сайт hh.ru разлогинил сессию — вакансии с тестом не отправить
     _web_auth_expired: bool = False
@@ -1445,16 +1448,30 @@ class Operation(BaseOperation):
                             logger.error(f"Ошибка отправки письма: {ex}")
             except VacancyCaptcha as ex:
                 logger.warning("hh запросил капчу: %s", ex)
-                if self._solve_captcha_with_ai(ex.captcha_url):
-                    # Эта вакансия вернётся в работу при следующем прогоне
+                if not self._solve_captcha_with_ai(ex.captcha_url):
+                    self._prepare_captcha(ex.captcha_url)
+                    print(
+                        "⏸ hh запросил капчу — ставлю отклики на паузу, "
+                        "продолжу после ввода капчи"
+                    )
+                    self.captcha_paused = True
+                    break
+                # Капча решена — повторяем именно эту вакансию, иначе решение
+                # потрачено впустую. hh после капчи подозрителен, поэтому
+                # сначала выжидаем.
+                if self._retry_after_captcha(resume, vacancy_id, letter):
+                    applied_count += 1
                     continue
-                self._prepare_captcha(ex.captcha_url)
-                print(
-                    "⏸ hh запросил капчу — ставлю отклики на паузу, "
-                    "продолжу после ввода капчи"
-                )
-                self.captcha_paused = True
-                break
+                # Повторить не вышло. Если осталась нерешённая картинка —
+                # ждём владельца, иначе просто идём дальше по списку.
+                if hhcaptcha.load_pending(self.tool.config_path) is not None:
+                    print(
+                        "⏸ hh запросил капчу — ставлю отклики на паузу, "
+                        "продолжу после ввода капчи"
+                    )
+                    self.captcha_paused = True
+                    break
+                continue
             except LimitExceeded:
                 do_apply = False
                 limit_reached = True
@@ -1878,6 +1895,45 @@ class Operation(BaseOperation):
     def _note_test_skipped(self, vacancy_id: str) -> None:
         # Своё множество у каждого запуска, а не общее у класса
         self._tests_skipped = {*self._tests_skipped, vacancy_id}
+
+    def _retry_after_captcha(
+        self, resume: dict[str, Any], vacancy_id: str, letter: str
+    ) -> bool:
+        """Повторяет отклик на вакансию после решённой капчи.
+
+        Возвращает True, если отклик всё-таки ушёл. Вторую капчу подряд тоже
+        пробуем решить: именно после неудачного первого решения hh чаще всего
+        просит её снова.
+        """
+        if self.dry_run:
+            return False
+        params = {
+            "resume_id": resume["id"],
+            "vacancy_id": vacancy_id,
+            "message": letter,
+        }
+        for _attempt in range(2):
+            wait = random.uniform(*self.captcha_cooldown)
+            logger.debug("Пауза после капчи: %.0f с", wait)
+            time.sleep(wait)
+            try:
+                res = self.api_client.post(
+                    "/negotiations", params, delay=random.uniform(2, 5)
+                )
+                assert res == {}
+                self._record_sent()
+                self._last_apply_at = time.monotonic()
+                print("📨 Отправили отклик на вакансию (после капчи)")
+                return True
+            except CaptchaRequired as ex:
+                if not self._solve_captcha_with_ai(ex.captcha_url):
+                    return False
+            except Redirect:
+                return False
+            except (ApiError, requests.RequestException) as ex:
+                logger.warning("Повтор после капчи не удался: %s", ex)
+                return False
+        return False
 
     def _pace_apply(self) -> bool:
         """Откликаемся не чаще раза в apply_interval (письмо пишется в счёт паузы).

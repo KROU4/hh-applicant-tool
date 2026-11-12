@@ -291,6 +291,47 @@ class TestCaptchaPause:
         assert not op.tool.storage.skipped_vacancies.save.called
         assert "hh запросил капчу" in capsys.readouterr().out
 
+    def test_solved_captcha_retries_the_same_vacancy(self, monkeypatch, capsys):
+        from hh_applicant_tool.api.errors import CaptchaRequired
+
+        from hh_applicant_tool.operations import apply_vacancies
+
+        monkeypatch.setattr(apply_vacancies.time, "sleep", lambda s: None)
+        op = _make_operation(max_responses=0)
+        op.captcha_cooldown = (0.0, 0.0)
+        op._solve_captcha_with_ai = MagicMock(return_value=True)
+        op.tool.api_client.post.side_effect = [CaptchaRequired(MagicMock(), {
+            "errors": [{"value": "captcha_required", "captcha_url": "https://hh.ru/account/captcha"}]
+        }), {}]
+        op._get_vacancies = lambda resume_id=None: iter([_make_vacancy(1)])
+        resume = {"id": "r1", "title": "Dev", "alternate_url": "u"}
+        user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+        op._apply_resume(resume=resume, user=user, seen_employers=set())
+
+        # капча решена — вакансия повторена, а не потеряна
+        assert op.tool.api_client.post.call_count == 2
+        assert "после капчи" in capsys.readouterr().out
+
+    def test_failed_captcha_retry_pauses_run(self, tmp_path):
+        from hh_applicant_tool.api.errors import CaptchaRequired
+
+        op = _make_operation(max_responses=0)
+        op.tool.config_path = tmp_path
+        op.captcha_cooldown = (0.0, 0.0)
+        op._solve_captcha_with_ai = MagicMock(return_value=True)
+        op.tool.api_client.post.side_effect = CaptchaRequired(MagicMock(), {
+            "errors": [{"value": "captcha_required", "captcha_url": "https://hh.ru/account/captcha"}]
+        })
+        op._get_vacancies = lambda resume_id=None: iter([_make_vacancy(1)])
+        resume = {"id": "r1", "title": "Dev", "alternate_url": "u"}
+        user = {"first_name": "A", "last_name": "B", "email": "a@b.c", "phone": ""}
+        from hh_applicant_tool.utils import hhcaptcha
+
+        hhcaptcha.pending_path(tmp_path).write_text("{}", encoding="utf-8")
+        op._apply_resume(resume=resume, user=user, seen_employers=set())
+
+        assert op.captcha_paused
+
     def test_vacancy_is_fetched_once_per_run(self):
         op = _make_operation(max_responses=0)
         op.included_filter = r"llm"

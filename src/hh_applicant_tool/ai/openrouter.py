@@ -1,4 +1,4 @@
-"""Роутер по бесплатным моделям OpenRouter.
+"""Роутер по моделям OpenRouter (текст — бесплатные, капча — платные vision).
 
 Запрос отправляется в первую доступную модель из списка приоритетов. Если
 модель перегружена (429 от провайдера), недоступна или вернула пустой ответ,
@@ -41,7 +41,11 @@ DEFAULT_TEXT_MODELS: tuple[str, ...] = (
 )
 
 DEFAULT_VISION_MODELS: tuple[str, ...] = (
-    # Только бесплатные модели: платное распознавание идёт через CapSolver
+    # Платные модели идут первыми: нарисованную кириллицу бесплатные читают
+    # через раз, а платная стоит около $0.0001 за капчу (дешевле CapSolver).
+    "google/gemini-2.5-flash-lite",
+    "google/gemini-2.5-flash",
+    # Бесплатные — дополнительный голос и запас без денег на балансе
     "qwen/qwen3.8-27b:free",
     "google/gemma-4-31b-it:free",
     "google/gemma-4-26b-a4b-it:free",
@@ -125,7 +129,7 @@ class ChatOpenRouter(ChatOpenAI):
     rate_limit: int = 20
     timeout: float = 90.0
     # Сколько vision-моделей спрашивать и сравнивать ответы
-    captcha_votes: int = 3
+    captcha_votes: int = 2
 
     def _default_headers(self) -> dict[str, str]:
         return {
@@ -282,7 +286,7 @@ class ChatOpenRouter(ChatOpenAI):
             ]
             if not candidates:
                 raise OpenRouterError(
-                    f"Нет доступных бесплатных моделей OpenRouter ({last_error})"
+                    f"Нет доступных моделей OpenRouter ({last_error})"
                 )
 
             now = time.monotonic()
@@ -471,27 +475,26 @@ class ChatOpenRouter(ChatOpenAI):
         return " ".join(words[-2:]).lower() if len(words) > 2 else " ".join(words).lower()
 
     def solve_captcha(self, image_data: bytes) -> str:
-        # Капчу всегда спрашиваем у нескольких бесплатных моделей
+        # Капчу всегда спрашиваем у нескольких моделей, начиная с платных
         return self.solve_captcha_consensus(image_data)
 
     def solve_captcha_consensus(self, image_data: bytes) -> str:
         """Спрашивает несколько моделей и возвращает самый частый ответ.
 
         Одна модель часто теряет одно из двух слов, поэтому ответы сравниваются
-        по большинству. Если все модели разные — берётся самый длинный (в нём
-        обычно больше слов), при равенстве — первый.
+        по большинству. Первыми идут платные модели: они читают искажённую
+        кириллицу точнее бесплатных. Если ответы разошлись — выигрывает ответ
+        более точной (первой) модели.
         """
         from collections import Counter
 
         messages = self._captcha_messages(image_data)
-        # Только бесплатные модели: платный вариант — CapSolver
-        candidates = [
-            m
-            for m in self._candidates(vision=True)
-            if m.endswith(":free")
-        ][: max(self.captcha_votes, 1)]
+        candidates = self._candidates(vision=True)
         if not candidates:
-            raise OpenRouterError("Нет доступных бесплатных vision-моделей")
+            raise OpenRouterError("Нет доступных vision-моделей")
+        # Первая модель списка — платная и самая точная: при равенстве голосов
+        # её ответ и выигрывает
+        candidates = candidates[: max(self.captcha_votes, 1)]
         answers: list[str] = []
         for model in candidates:
             try:
@@ -510,7 +513,9 @@ class ChatOpenRouter(ChatOpenAI):
 
         answer, count = Counter(answers).most_common(1)[0]
         if count == 1:
-            answer = max(answers, key=lambda a: (len(a.split()), len(a)))
+            # Все ответы разные. Берём ответ самой точной модели из тех, кто
+            # ответил, а не самый длинный: бесплатные любят дописывать слова.
+            answer = answers[0]
         logger.info("Капча: голоса моделей %r, выбран %r", answers, answer)
         return answer
 

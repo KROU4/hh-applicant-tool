@@ -291,7 +291,7 @@ def test_captcha_consensus_survives_errors_and_strips_prefix():
     assert client.solve_captcha_consensus(b"png") == "шеин умолкая"
 
 
-def test_captcha_consensus_ignores_paid_models():
+def test_captcha_consensus_uses_paid_models():
     session = FakeSession({"paid/model": [ok("платная")]})
     client = ChatOpenRouter(
         "key",
@@ -300,8 +300,7 @@ def test_captcha_consensus_ignores_paid_models():
         rate_limit=0,
         max_wait=0,
     )
-    with pytest.raises(OpenRouterError, match="бесплатных"):
-        client.solve_captcha_consensus(b"png")
+    assert client.solve_captcha_consensus(b"png") == "платная"
 
 
 def test_captcha_normalize_keeps_two_words():

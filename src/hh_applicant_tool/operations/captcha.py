@@ -37,7 +37,7 @@ class Operation(BaseOperation):
         group.add_argument(
             "--auto",
             metavar="URL",
-            help="Решить капчу автоматически (OpenRouter, затем CapSolver)",
+            help="Решить капчу автоматически (vision-модель OpenRouter)",
         )
         group.add_argument(
             "--check",

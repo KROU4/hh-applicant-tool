@@ -14,6 +14,7 @@ from hh_applicant_tool.tgbot.bot import (
     in_hours,
     summarize_log,
 )
+from hh_applicant_tool.utils import hhcaptcha
 
 
 class FakeAPI:
@@ -737,6 +738,7 @@ def test_captcha_pause_retries_in_an_hour(bot):
     )
     task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies"])
     task.proc.alive = False
+    hhcaptcha.pending_path(bot.config_path).write_text("{}", encoding="utf-8")
     before = time.time()
     bot._on_task_finish(task, 3)
     assert bot.state.last_run("apply_next") == pytest.approx(before + 3600, abs=5)
@@ -884,6 +886,7 @@ def test_unanswered_captcha_backs_off_and_answer_resets(bot):
     (bot.runner.logs_dir / "apply.log").write_text("⏸ hh запросил капчу\n", encoding="utf-8")
     delays = []
     for _ in range(5):
+        hhcaptcha.pending_path(bot.config_path).write_text("{}", encoding="utf-8")
         task = bot.runner.start("apply", "🚀 Отклики", ["apply-vacancies"])
         task.proc.alive = False
         before = time.time()

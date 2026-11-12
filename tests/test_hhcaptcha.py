@@ -14,14 +14,20 @@ def make_tool(tmp_path, *, submit_status=302, location="/"):
     session = MagicMock()
     posts = []
 
-    def post(url, params=None, headers=None, allow_redirects=True):
-        posts.append((url, params))
+    def post(url, params=None, data=None, headers=None, allow_redirects=True):
+        posts.append((url, params, data))
         if url == "https://hh.ru/captcha":
             return SimpleNamespace(
                 raise_for_status=lambda: None,
                 json=lambda: {"key": f"key-{len(posts)}"},
             )
-        return SimpleNamespace(status_code=submit_status, headers={"Location": location})
+        return SimpleNamespace(
+            status_code=submit_status,
+            headers={"Location": location},
+            json=lambda: {
+                "hhcaptcha": {"captchaState": f"STATE-{len(posts)}"}
+            },
+        )
 
     session.post.side_effect = post
     session.get.side_effect = lambda url, params=None, headers=None: SimpleNamespace(
@@ -49,22 +55,20 @@ def test_prepare_saves_image_and_state(tmp_path):
     assert path.read_bytes() == b"PNG"
     info = hhcaptcha.load_pending(tmp_path)
     assert info["captcha_state"] == "STATE" and info["key"] == "key-1"
-    assert posts[0] == ("https://hh.ru/captcha", {"lang": "RU"})
+    assert posts[0][0] == "https://hh.ru/captcha"
+    assert posts[0][1] == {"lang": "RU"}
 
 
 def test_correct_answer_is_sent_and_clears_state(tmp_path):
     tool, posts = make_tool(tmp_path)
     hhcaptcha.prepare(tool, CAPTCHA_URL)
     assert hhcaptcha.submit(tool, " хатку кропил ")
-    url, params = posts[-1]
+    url, params, data = posts[-1]
     assert url == "https://hh.ru/account/captcha"
-    assert params == {
-        "captchaText": "хатку кропил",
-        "captchaKey": "key-1",
-        "captchaState": "STATE",
-        "backurl": "/",
-        "failurl": CAPTCHA_URL,
-    }
+    assert params["state"] == params["captchaState"] == "STATE"
+    assert data["captchaText"] == "хатку кропил"
+    assert data["captchaKey"] == "key-1"
+    assert data["_xsrf"] == "x" and data["isBot"] == "false"
     assert hhcaptcha.load_pending(tmp_path) is None
     assert not hhcaptcha.image_path(tmp_path).exists()
 
@@ -73,7 +77,9 @@ def test_wrong_answer_prepares_new_image(tmp_path):
     tool, posts = make_tool(tmp_path, submit_status=403)
     hhcaptcha.prepare(tool, CAPTCHA_URL)
     assert not hhcaptcha.submit(tool, "неверно")
-    assert hhcaptcha.load_pending(tmp_path)["key"] == "key-3"
+    info = hhcaptcha.load_pending(tmp_path)
+    # Новая капча взята из ответа hh, а не из старого состояния
+    assert info["key"] == "key-3" and info["captcha_state"].startswith("STATE-")
 
 
 def test_submit_without_pending_captcha(tmp_path):
@@ -94,8 +100,8 @@ def test_solve_with_ai_retries_after_wrong_answer(tmp_path):
     # Первый ответ — редирект обратно на капчу, второй принят
     answers = iter([("/captcha", 302), ("/", 302)])
 
-    def post(url, params=None, headers=None, allow_redirects=True):
-        posts.append((url, params))
+    def post(url, params=None, data=None, headers=None, allow_redirects=True):
+        posts.append((url, params, data))
         if url == "https://hh.ru/captcha":
             return SimpleNamespace(
                 raise_for_status=lambda: None, json=lambda: {"key": f"key-{len(posts)}"}
@@ -110,7 +116,7 @@ def test_solve_with_ai_retries_after_wrong_answer(tmp_path):
 
     assert hhcaptcha.solve_with_ai(tool, CAPTCHA_URL, pause=(0, 0)) is True
     assert ai.solve_captcha.call_count == 2
-    submitted = [p["captchaText"] for u, p in posts if u.endswith("/account/captcha")]
+    submitted = [d["captchaText"] for u, p, d in posts if u.endswith("/account/captcha")]
     assert submitted == ["abc12", "x y9"]
     assert hhcaptcha.load_pending(tmp_path) is None
 
@@ -134,6 +140,7 @@ def test_solve_with_ai_gives_up_without_ai_or_after_attempts(tmp_path):
 def test_solve_uses_capsolver_after_openrouter_failure(tmp_path):
     tool, _ = make_tool(tmp_path, location="/")
     tool.config["capsolver"] = {"api_key": "CAP-test"}
+    tool.config["captcha"]["providers"] = ["openrouter", "capsolver"]
     ai = MagicMock()
     ai.solve_captcha.side_effect = ValueError("модель недоступна")
     tool.get_captcha_ai = lambda: ai
@@ -153,10 +160,11 @@ def test_solve_uses_capsolver_after_wrong_openrouter_answer(tmp_path):
     tool, posts = make_tool(tmp_path)
     tool.config["capsolver"] = {"api_key": "CAP-test"}
     tool.config["captcha"]["attempts"] = 1
+    tool.config["captcha"]["providers"] = ["openrouter", "capsolver"]
     answers = iter([("/captcha", 403), ("/", 302)])
 
-    def post(url, params=None, headers=None, allow_redirects=True):
-        posts.append((url, params))
+    def post(url, params=None, data=None, headers=None, allow_redirects=True):
+        posts.append((url, params, data))
         if url == "https://hh.ru/captcha":
             return SimpleNamespace(
                 raise_for_status=lambda: None,
@@ -178,7 +186,7 @@ def test_solve_uses_capsolver_after_wrong_openrouter_answer(tmp_path):
         assert hhcaptcha.solve_with_ai(tool, CAPTCHA_URL, pause=(0, 0)) is True
     finally:
         monkeypatch.undo()
-    submitted = [p["captchaText"] for u, p in posts if u.endswith("/account/captcha")]
+    submitted = [d["captchaText"] for u, p, d in posts if u.endswith("/account/captcha")]
     assert submitted == ["неверно", "верный ответ"]
     capsolver.solve_image.assert_called_once()
 
