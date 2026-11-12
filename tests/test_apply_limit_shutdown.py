@@ -542,6 +542,29 @@ def test_applies_are_spaced_out(monkeypatch):
     assert sleeps == [300.0, 300.0]
 
 
+def test_pauses_grow_after_captchas(monkeypatch):
+    from hh_applicant_tool.operations import apply_vacancies
+
+    clock = [1000.0]
+    sleeps = []
+
+    def fake_sleep(s):
+        sleeps.append(s)
+        clock[0] += s
+
+    monkeypatch.setattr(apply_vacancies.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(apply_vacancies.time, "sleep", fake_sleep)
+    monkeypatch.setattr(apply_vacancies.random, "uniform", lambda a, b: b)
+    op = _make_operation(max_responses=0)
+    op.apply_interval = (100.0, 100.0)
+    op._captcha_count = 2
+
+    assert op._pace_apply() is True  # первый отклик — сразу
+    assert op._pace_apply() is True
+    # фактор 1 + 0.75*2 = 2.5 -> пауза 250 с вместо 100
+    assert sleeps == [250.0]
+
+
 def test_stop_during_apply_pause_sends_nothing_more():
     op = _make_operation(max_responses=0)
     op.apply_interval = (300.0, 300.0)

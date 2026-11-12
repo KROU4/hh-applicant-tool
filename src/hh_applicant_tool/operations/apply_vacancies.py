@@ -192,6 +192,8 @@ class Operation(BaseOperation):
     # Пауза после решённой капчи перед повтором вакансии: hh снимает
     # подозрительность не мгновенно
     captcha_cooldown: tuple[float, float] = (45.0, 120.0)
+    # Сколько капч уже было за прогон: после них откликаемся реже
+    _captcha_count: int = 0
     _last_apply_at: float | None = None
     # Сайт hh.ru разлогинил сессию — вакансии с тестом не отправить
     _web_auth_expired: bool = False
@@ -1448,6 +1450,7 @@ class Operation(BaseOperation):
                             logger.error(f"Ошибка отправки письма: {ex}")
             except VacancyCaptcha as ex:
                 logger.warning("hh запросил капчу: %s", ex)
+                self._captcha_count += 1
                 if not self._solve_captcha_with_ai(ex.captcha_url):
                     self._prepare_captcha(ex.captcha_url)
                     print(
@@ -1942,6 +1945,11 @@ class Operation(BaseOperation):
         бот ждёт мягкой остановки лишь секунды, а пауза длится минуты.
         """
         low, high = self.apply_interval
+        # Капча — сигнал, что hh считает темп высоким: после неё пауза растёт
+        # (до трёх раз), иначе каждая следующая вакансия снова упирается в неё
+        if self._captcha_count:
+            factor = min(1 + 0.75 * self._captcha_count, 3.0)
+            low, high = low * factor, high * factor
         now = time.monotonic()
         cancel = getattr(self, "_cancel_event", None)
         if self._last_apply_at is not None and high > 0:
