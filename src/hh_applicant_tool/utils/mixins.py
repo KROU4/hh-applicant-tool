@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta
 from functools import cache
 from importlib.metadata import version
@@ -50,11 +51,20 @@ class VersionChecker:
             latest_ver := self.storage.settings.get_value("_latest_version")
         ) and (cur_ver := get_package_version()):
             if parse_version(latest_ver) > parse_version(cur_ver):
-                log.warning(
-                    "ТЕКУЩАЯ ВЕРСИЯ %s УСТАРЕЛА. РЕКОМЕНДУЕТСЯ ОБНОВИТЬ ЕЁ ДО ВЕРСИИ %s.",
-                    cur_ver,
-                    latest_ver,
-                )
+                # Не чаще раза в сутки: предупреждение не должно попадать в
+                # каждый прогон и каждый лог своей копией
+                now = time.time()
+                if now >= float(
+                    self.storage.settings.get_value("_next_version_warn", 0)
+                ):
+                    log.warning(
+                        "ТЕКУЩАЯ ВЕРСИЯ %s УСТАРЕЛА. РЕКОМЕНДУЕТСЯ ОБНОВИТЬ ЕЁ ДО ВЕРСИИ %s.",
+                        cur_ver,
+                        latest_ver,
+                    )
+                    self.storage.settings.set_value(
+                        "_next_version_warn", now + 86400
+                    )
 
 
 class MegaTool(VersionChecker):

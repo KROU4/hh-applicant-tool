@@ -565,6 +565,66 @@ def test_pauses_grow_after_captchas(monkeypatch):
     assert sleeps == [250.0]
 
 
+def test_test_vacancy_captcha_is_solved_and_retried(monkeypatch):
+    from hh_applicant_tool.operations import apply_vacancies
+
+    monkeypatch.setattr(apply_vacancies.time, "sleep", lambda s: None)
+    op = _make_operation(max_responses=0)
+    op.captcha_cooldown = (0.0, 0.0)
+    op._get_vacancy_tests = lambda url: {
+        "7": {"uidPk": "u", "guid": "g", "startTime": "1", "required": "false", "tasks": []}
+    }
+    op._solve_captcha_with_ai = MagicMock(return_value=True)
+    op.tool.session.post.side_effect = [
+        SimpleNamespace(
+            request=SimpleNamespace(method="POST"),
+            url="https://hh.ru/applicant/vacancy_response/popup",
+            status_code=403,
+            json=lambda: {"hhcaptcha": {"captchaState": "STATE"}},
+        ),
+        SimpleNamespace(
+            request=SimpleNamespace(method="POST"),
+            url="https://hh.ru/applicant/vacancy_response/popup",
+            status_code=200,
+            json=lambda: {"success": "true"},
+        ),
+    ]
+
+    result = op._solve_vacancy_test("7", "r1", "letter")
+
+    assert result["success"] == "true"
+    assert op.tool.session.post.call_count == 2
+    assert op._captcha_count == 1
+    op._solve_captcha_with_ai.assert_called_once_with(
+        "https://hh.ru/account/captcha?state=STATE"
+    )
+
+
+def test_test_vacancy_captcha_failure_prepares_image(monkeypatch):
+    from hh_applicant_tool.operations import apply_vacancies
+
+    monkeypatch.setattr(apply_vacancies.time, "sleep", lambda s: None)
+    op = _make_operation(max_responses=0)
+    op._get_vacancy_tests = lambda url: {
+        "7": {"uidPk": "u", "guid": "g", "startTime": "1", "required": "false", "tasks": []}
+    }
+    op._solve_captcha_with_ai = MagicMock(return_value=False)
+    op._prepare_captcha = MagicMock()
+    op.tool.session.post.return_value = SimpleNamespace(
+        request=SimpleNamespace(method="POST"),
+        url="https://hh.ru/applicant/vacancy_response/popup",
+        status_code=403,
+        json=lambda: {"hhcaptcha": {"captchaState": "STATE"}},
+    )
+
+    result = op._solve_vacancy_test("7", "r1", "letter")
+
+    assert result["_http_status"] == 403
+    op._prepare_captcha.assert_called_once_with(
+        "https://hh.ru/account/captcha?state=STATE"
+    )
+
+
 def test_stop_during_apply_pause_sends_nothing_more():
     op = _make_operation(max_responses=0)
     op.apply_interval = (300.0, 300.0)

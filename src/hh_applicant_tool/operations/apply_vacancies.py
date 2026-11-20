@@ -1631,40 +1631,63 @@ class Operation(BaseOperation):
         # Ожидание перед отправкой (float)
         time.sleep(random.uniform(2.0, 3.0))
 
-        response = self.tool.session.post(
-            "https://hh.ru/applicant/vacancy_response/popup",
-            data=payload,
-            headers={
-                "Referer": response_url,
-                # x-gib-fgsscgib-w-hh и x-gib-gsscgib-w-hh вроде в куках
-                # передаются и не нужны
-                "X-Hhtmfrom": "vacancy",
-                "X-Hhtmsource": "vacancy_response",
-                "X-Requested-With": "XMLHttpRequest",
-                "X-Xsrftoken": self.tool.xsrf_token,
-            },
-        )
-
-        logger.debug(
-            "%s %s %d",
-            response.request.method,
-            response.url,
-            response.status_code,
-        )
-
-        try:
-            data = response.json()
-        except (ValueError, requests.exceptions.JSONDecodeError) as ex:
-            logger.warning(
-                "Ответ на отклик с тестом не является JSON (status=%s, %s), result: %s",
-                response.status_code,
-                response.url,
-                shorten(response.text, 300),
+        response = None
+        data: Any = None
+        for attempt in range(2):
+            response = self.tool.session.post(
+                "https://hh.ru/applicant/vacancy_response/popup",
+                data=payload,
+                headers={
+                    "Referer": response_url,
+                    # x-gib-fgsscgib-w-hh и x-gib-gsscgib-w-hh вроде в куках
+                    # передаются и не нужны
+                    "X-Hhtmfrom": "vacancy",
+                    "X-Hhtmsource": "vacancy_response",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "X-Xsrftoken": self.tool.xsrf_token,
+                },
             )
-            raise ValueError(
-                "Эндпоинт отклика на тест вернул не-JSON ответ "
-                "(возможно, перенаправление на капчу или форму)."
-            ) from ex
+
+            logger.debug(
+                "%s %s %d",
+                response.request.method,
+                response.url,
+                response.status_code,
+            )
+
+            try:
+                data = response.json()
+            except (ValueError, requests.exceptions.JSONDecodeError) as ex:
+                logger.warning(
+                    "Ответ на отклик с тестом не является JSON (status=%s, %s), result: %s",
+                    response.status_code,
+                    response.url,
+                    shorten(response.text, 300),
+                )
+                raise ValueError(
+                    "Эндпоинт отклика на тест вернул не-JSON ответ "
+                    "(возможно, перенаправление на капчу или форму)."
+                ) from ex
+
+            # На отклик с тестом hh тоже может ответить капчей — в JSON
+            # приходит captchaState. Решаем и повторяем отправку, иначе
+            # вакансия с тестом теряется как «ошибка».
+            captcha_state = (
+                (data.get("hhcaptcha") or {}).get("captchaState")
+                if isinstance(data, dict)
+                else None
+            )
+            if response.status_code != 403 or not captcha_state:
+                break
+            self._captcha_count += 1
+            captcha_url = f"https://hh.ru/account/captcha?state={captcha_state}"
+            if attempt == 0 and self._solve_captcha_with_ai(captcha_url):
+                self._last_apply_at = time.monotonic()
+                time.sleep(random.uniform(*self.captcha_cooldown))
+                continue
+            # Не решили — показываем картинку владельцу и не тратим попытки
+            self._prepare_captcha(captcha_url)
+            break
 
         if isinstance(data, dict):
             data["_http_status"] = response.status_code

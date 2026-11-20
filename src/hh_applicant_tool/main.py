@@ -322,7 +322,7 @@ class HHApplicantTool(MegaTool):
     def handle_captcha(self, captcha_url: str) -> bool:
         """Пробует решить капчу автоматически (OpenRouter, затем CapSolver)."""
         captcha_config = self.config.get("captcha") or {}
-        limit = int(captcha_config.get("max_auto") or 10)
+        limit = int(captcha_config.get("max_auto") or 50)
         if self._captcha_auto_count >= limit:
             logger.info(
                 "Автоматически решено %d капч за прогон — дальше решает человек",

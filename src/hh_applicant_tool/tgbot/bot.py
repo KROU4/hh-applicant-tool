@@ -1504,6 +1504,19 @@ class HHBot:
             head = f"❌ {task.title}: ошибка (код {code})"
 
         # Плановые задачи без ошибок не должны спамить уведомлениями
+        if (
+            task.name == "refresh_token"
+            and WEB_AUTH_EXPIRED_MARKER in log
+            and not self.web_login_active()
+        ):
+            # Веб-сессия нужна для откликов с тестами: сообщаем сразу, а не
+            # только в отчёте прогона, где это легко пропустить
+            self.notify(
+                "🔑 <b>Сессия сайта hh.ru истекла.</b>\n"
+                "Вакансии с тестами не отправляются, пока не войдёте заново. "
+                "Вход по коду занимает минуту.",
+                markup=keyboard([[button("🔑 Войти по коду", "weblogin:start")]]),
+            )
         if task.scheduled and code == 0 and task.name != "apply":
             return
         dry_run = task.name == "apply" and "--dry-run" in task.args
