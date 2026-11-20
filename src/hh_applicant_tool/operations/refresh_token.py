@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 from typing import TYPE_CHECKING
 
 from ..main import BaseNamespace, BaseOperation
@@ -52,7 +53,10 @@ class Operation(BaseOperation):
         прогон потеряет все вакансии с тестом.
         """
         try:
-            tool.get_redirect_config(WEB_SESSION_URL)
-        except Exception as ex:
-            if "Авторизация истекла" in str(ex):
-                print(WEB_SESSION_EXPIRED_MARKER)
+            page = tool.session.get("https://hh.ru")
+        except Exception:
+            return
+        # Страницы с redirectConfig бывают «авторизованы» частично, а на
+        # самом hh.ru неавторизованную сессию видно по login в состоянии
+        if not re.search(r'^\s+login: "', page.text, re.MULTILINE):
+            print(WEB_SESSION_EXPIRED_MARKER)

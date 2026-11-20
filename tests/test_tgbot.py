@@ -746,6 +746,20 @@ def test_captcha_pause_retries_in_an_hour(bot):
     assert "Отправлено откликов: <b>1</b>" in text
 
 
+def test_expired_web_session_from_refresh_token_notifies_with_button(bot):
+    (bot.runner.logs_dir / "refresh_token.log").write_text(
+        "ℹ️ Токен не истек.\n🔑 Сессия сайта hh.ru истекла\n", encoding="utf-8"
+    )
+    task = bot.runner.start(
+        "refresh_token", "🔑 Обновление токена", ["refresh-token"], scheduled=True
+    )
+    task.proc.alive = False
+    bot._on_task_finish(task, 0)
+    text, markup = bot.api.sent[-1][1], bot.api.sent[-1][2]
+    assert "Сессия сайта hh.ru истекла" in text
+    assert "Войти по коду" in str(markup)
+
+
 def test_dry_run_is_limited_and_ignores_quota(bot):
     bot.state.set("apply", "dry_run", True)
     write_sent(bot, [time.time() - 60] * 200)

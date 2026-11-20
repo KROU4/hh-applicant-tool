@@ -1,35 +1,37 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from hh_applicant_tool.operations import refresh_token
 
 
-class AuthExpired(Exception):
-    pass
-
-
-def make_tool(raises: bool):
+def make_tool(html: str):
     class Tool:
-        def get_redirect_config(self, url):
-            if raises:
-                raise AuthExpired("Авторизация истекла требуется новая!")
-            return {"redirectConfig": {}}
+        session = SimpleNamespace(
+            get=lambda url: SimpleNamespace(text=html)
+        )
 
     return Tool()
 
 
 def test_web_session_expired_marker(capsys):
-    refresh_token.Operation._check_web_session(make_tool(True))
+    refresh_token.Operation._check_web_session(make_tool("  login: null\n"))
     assert refresh_token.WEB_SESSION_EXPIRED_MARKER in capsys.readouterr().out
 
 
 def test_web_session_ok_is_silent(capsys):
-    refresh_token.Operation._check_web_session(make_tool(False))
+    refresh_token.Operation._check_web_session(
+        make_tool('  login: "user@example.com"\n')
+    )
     assert capsys.readouterr().out == ""
 
 
-def test_other_errors_do_not_mark_session_dead():
+def test_other_errors_do_not_mark_session_dead(capsys):
     class Tool:
-        def get_redirect_config(self, url):
-            raise OSError("network down")
+        class session:
+            @staticmethod
+            def get(url):
+                raise OSError("network down")
 
     refresh_token.Operation._check_web_session(Tool())
+    assert capsys.readouterr().out == ""

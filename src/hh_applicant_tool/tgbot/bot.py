@@ -2026,7 +2026,12 @@ class HHBot:
 
         if (
             now - self.state.last_run("refresh_token") > REFRESH_TOKEN_EVERY
-            and not self.runner.running_tasks()
+            # Автоответчик живёт постоянно и токен не меняет — он не мешает
+            and not [
+                t
+                for t in self.runner.running_tasks()
+                if t.name != "autoresponder"
+            ]
             and token.get("refresh_token")
         ):
             self.start_task("refresh_token", scheduled=True)
