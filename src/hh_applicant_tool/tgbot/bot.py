@@ -1515,7 +1515,7 @@ class HHBot:
                 "🔑 <b>Сессия сайта hh.ru истекла.</b>\n"
                 "Вакансии с тестами не отправляются, пока не войдёте заново. "
                 "Вход по коду занимает минуту.",
-                markup=keyboard([[button("🔑 Войти по коду", "weblogin:start")]]),
+                markup=keyboard([button("🔑 Войти по коду", "weblogin:start")]),
             )
         if task.scheduled and code == 0 and task.name != "apply":
             return
@@ -1652,7 +1652,7 @@ class HHBot:
         self.notify(
             "🔐 hh просит капчу, но картинку получить не удалось.\n"
             f"Откройте {url} в браузере, решите её и нажмите «Продолжить».",
-            markup=keyboard([[button("▶️ Продолжить", "run:apply")]]),
+            markup=keyboard([button("▶️ Продолжить", "run:apply")]),
         )
 
     # ---------------------------------------------------------------- captcha

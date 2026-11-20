@@ -757,7 +757,7 @@ def test_expired_web_session_from_refresh_token_notifies_with_button(bot):
     bot._on_task_finish(task, 0)
     text, markup = bot.api.sent[-1][1], bot.api.sent[-1][2]
     assert "Сессия сайта hh.ru истекла" in text
-    assert "Войти по коду" in str(markup)
+    assert markup["inline_keyboard"][0][0]["callback_data"] == "weblogin:start"
 
 
 def test_dry_run_is_limited_and_ignores_quota(bot):

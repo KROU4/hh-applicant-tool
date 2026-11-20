@@ -54,7 +54,13 @@ def redact(text: object) -> str:
 def _markup_rejected(ex: "TelegramError") -> bool:
     return any(
         s in ex.description.lower()
-        for s in ("can't parse entities", "message is too long", "text is too long")
+        for s in (
+            "can't parse entities",
+            "message is too long",
+            "text is too long",
+            "inlinekeyboardbutton",
+            "reply markup",
+        )
     )
 
 
