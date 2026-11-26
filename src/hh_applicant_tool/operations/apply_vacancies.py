@@ -50,6 +50,11 @@ VACANCY_CACHE_SIZE = 50
 # Обрыв соединения при загрузке выдачи: столько попыток, пауза растёт
 PAGE_RETRIES = 3
 PAGE_RETRY_DELAY = 10
+# Сколько страниц смотреть на один запрос при многозапросном поиске.
+# У hh глубина выдачи — 2000 вакансий на запрос, поэтому несколько узких
+# запросов по 300 результатов видят больше, чем один широкий на 2000,
+# где топ занимают «Агент по недвижимости» (синоним слова AI).
+SEARCH_QUERY_PAGES = 3
 # Отметка в skipped_vacancies: hh отверг отклик, повторять бессмысленно
 APPLY_FAILED_REASON = "apply_failed"
 # Ошибка main.parse_redirect_config, когда сайт видит нас анонимом, и строка
@@ -72,6 +77,21 @@ def is_permanent_apply_error(status: int | None, error: str | None) -> bool:
         and bool(error)
         and error not in RETRYABLE_APPLY_ERRORS
     )
+
+
+def parse_search_query(raw: str) -> tuple[str | None, str]:
+    """Разбирает `name:llm OR rag` / `desc:python AND ai`.
+
+    Возвращает (поле поиска или None, текст запроса). Без префикса поле
+    берётся из общего --search-field.
+    """
+    text = (raw or "").strip()
+    lowered = text.lower()
+    if lowered.startswith("name:"):
+        return "name", text[5:].strip()
+    if lowered.startswith("desc:"):
+        return None, text[5:].strip()
+    return None, text
 
 
 # Время каждого отправленного отклика (для лимита hh за 24 часа)
@@ -137,6 +157,9 @@ class Namespace(BaseNamespace):
     letter_contact: str | None
     order_by: str
     search: str
+    search_queries: list[str] | None
+    search_order: str | None
+    local_any_format: bool
     schedule: str
     work_format: list[str] | None
     dry_run: bool
@@ -213,6 +236,29 @@ class Operation(BaseOperation):
             "--search",
             help="Строка поиска для фильтрации вакансий. Если указана, то поиск будет производиться по вакансиям. В остальных случаях отклики будут производиться по списку рекомендованных вакансий.",  # noqa: E501
             type=str,
+        )
+        parser.add_argument(
+            "--search-query",
+            dest="search_queries",
+            action="append",
+            metavar="[name:|desc:]<запрос>",
+            help="Дополнительный поисковый запрос hh; можно указать несколько. "
+            "Каждый ищется отдельно, поэтому узкие запросы не размывают друг "
+            "друга. Префикс name: ограничивает поиск названием вакансии, "
+            "desc: — всеми полями (по умолчанию как у --search-field).",
+        )
+        parser.add_argument(
+            "--search-order",
+            choices=["relevance", "publication_time", "both"],
+            help="Порядок выдачи для поиска: по релевантности, по дате "
+            "публикации (сначала свежие) или оба прохода. Свежие вакансии "
+            "часто не попадают в топ релевантности.",
+        )
+        parser.add_argument(
+            "--local-any-format",
+            action=argparse.BooleanOptionalAction,
+            help="Вакансии из --priority-area искать при любом формате работы, "
+            "а не только в выбранном (локальные офисные тоже)",
         )
         parser.add_argument(
             "-L",
@@ -517,6 +563,14 @@ class Operation(BaseOperation):
         self.schedule = args.schedule
         self.work_format = args.work_format
         self.search = args.search
+        self.search_queries = [
+            parsed
+            for parsed in map(parse_search_query, args.search_queries or [])
+            if parsed[1]
+        ]
+        self.search_order = args.search_order
+        self.local_any_format = bool(args.local_any_format)
+        self._all_fields_ids: set[str] = set()
         self.search_field = args.search_field
         self.sort_point_lat = args.sort_point_lat
         self.sort_point_lng = args.sort_point_lng
@@ -1843,48 +1897,108 @@ class Operation(BaseOperation):
                 rest.append(vacancy)
         yield from rest
 
+    def _search_orders(self) -> list[str | None]:
+        order = getattr(self, "search_order", None)
+        if order == "both":
+            return ["relevance", "publication_time"]
+        if order:
+            return [order]
+        return [None]
+
+    def _queries(self) -> list[tuple[str | None, str]]:
+        if getattr(self, "search_queries", None):
+            return self.search_queries
+        if self.search:
+            return [(None, self.search)]
+        return []
+
     def _source_vacancies(
         self, resume_id: str | None = None
     ) -> Iterator[SearchVacancy]:
         similar = f"/resumes/{resume_id}/similar_vacancies"
-        if not self.search:
+        queries = self._queries()
+        if not queries:
             yield from self._paginate(similar, {})
             return
 
-        # Сначала самое релевантное: рекомендации hh под это резюме, затем
-        # поиск в приоритетном регионе, затем везде. Повторы пропускаем
-        sources: list[tuple[str, dict[str, Any]]] = []
         priority_area = getattr(self, "priority_area", None)
         if self.area:
             priority_area = None
-        if getattr(self, "recommended_first", False) and resume_id:
-            # Рекомендации — тоже только из приоритетного региона, иначе hh
-            # подмешивает вакансии из других стран раньше своих
-            recommended = {"text": None, "search_field": None}
-            if priority_area:
-                recommended["area"] = list(priority_area)
-            sources.append((similar, recommended))
-        if priority_area:
-            sources.append(("/vacancies", {"area": list(priority_area)}))
         other_areas = getattr(self, "other_areas", None) or "all"
-        if not priority_area or other_areas == "all":
-            sources.append(("/vacancies", {}))
-        elif other_areas == "remote":
-            # Из других стран интересна только удалёнка
-            sources.append(("/vacancies", {"work_format": ["REMOTE"]}))
-
+        orders = self._search_orders()
+        local_any_format = bool(getattr(self, "local_any_format", False))
+        if not hasattr(self, "_all_fields_ids"):
+            self._all_fields_ids = set()
+        # Узкие запросы: глубже первых страниц смысла мало, а запросов много
+        query_pages = min(self.total_pages, SEARCH_QUERY_PAGES)
         seen: set[str] = set()
-        for url, overrides in sources:
-            for vacancy in self._paginate(url, overrides):
+
+        def emit(
+            url: str,
+            overrides: dict[str, Any],
+            pages: int,
+            text: str | None = None,
+            field: str | None = None,
+        ) -> Iterator[SearchVacancy]:
+            """Помечает вакансии из запросов «по всем полям».
+
+            Их ключевые слова нужно проверять и в описании, а не только в
+            названии (см. _is_included / _is_excluded).
+            """
+            for vacancy in self._paginate(url, overrides, pages):
                 if vacancy["id"] in seen:
                     continue
                 seen.add(vacancy["id"])
+                if text is not None and field is None:
+                    self._all_fields_ids.add(vacancy["id"])
                 yield vacancy
 
+        # Рекомендации hh под резюме: самое релевантное, но не единственный
+        # источник — новые вакансии hh подмешивает туда не сразу
+        if getattr(self, "recommended_first", False) and resume_id:
+            recommended = {"text": None, "search_field": None}
+            if priority_area:
+                recommended["area"] = list(priority_area)
+                if local_any_format:
+                    recommended["work_format"] = None
+            for order in orders:
+                overrides = dict(recommended)
+                if order:
+                    overrides["order_by"] = order
+                yield from emit(
+                    similar, overrides, min(self.total_pages, SEARCH_QUERY_PAGES)
+                )
+
+        for field, text in queries:
+            for order in orders:
+                base: dict[str, Any] = {"text": text}
+                if field:
+                    base["search_field"] = [field]
+                if order:
+                    base["order_by"] = order
+                if priority_area:
+                    # Локальные вакансии идут первыми; с --local-any-format
+                    # берём их при любом формате, а не только удалёнку
+                    local = dict(base, area=list(priority_area))
+                    if local_any_format:
+                        local["work_format"] = None
+                    yield from emit("/vacancies", local, query_pages, text, field)
+                if not priority_area or other_areas == "all":
+                    yield from emit("/vacancies", base, query_pages, text, field)
+                elif other_areas == "remote":
+                    # Из других стран интересна только удалёнка
+                    remote = dict(base, work_format=["REMOTE"])
+                    yield from emit(
+                        "/vacancies", remote, query_pages, text, field
+                    )
+
     def _paginate(
-        self, url: str, overrides: dict[str, Any]
+        self,
+        url: str,
+        overrides: dict[str, Any],
+        pages: int | None = None,
     ) -> Iterator[SearchVacancy]:
-        for page in range(self.total_pages):
+        for page in range(self.total_pages if pages is None else pages):
             logger.debug("Загружаем вакансии: %s, страница %d", url, page + 1)
             params = self._get_search_params(page)
             for key, value in overrides.items():
@@ -2080,11 +2194,22 @@ class Operation(BaseOperation):
             + " ".join(s.get("name", "") for s in full.get("key_skills") or [])
         )
 
+    def _searches_in_name(self, vacancy: SearchVacancy) -> bool:
+        """Ключевые слова проверяем только в названии.
+
+        Так --search-field name, а также вакансии из name-запросов. Для
+        запросов «по всем полям» hh уже нашёл слова в описании, поэтому
+        описание проверяем и мы.
+        """
+        if vacancy.get("id") in getattr(self, "_all_fields_ids", ()):
+            return False
+        return "name" in (getattr(self, "search_field", None) or [])
+
     def _is_included(self, vacancy: SearchVacancy) -> bool:
         if not self.included_filter:
             return True
         pattern = re.compile(self.included_filter, re.IGNORECASE)
-        if "name" in (getattr(self, "search_field", None) or []):
+        if self._searches_in_name(vacancy):
             # Ищем по названию — и ключевые слова только в названии: в
             # сниппете «Python» или «ML» мелькают у аналитиков, ассистентов и
             # руководителей. В описание не лезем: каждый лишний просмотр
@@ -2118,7 +2243,7 @@ class Operation(BaseOperation):
             self.excluded_filter, re.IGNORECASE
         )
 
-        if "name" in (getattr(self, "search_field", None) or []):
+        if self._searches_in_name(vacancy):
             # Ищем по названию — и стоп-слова смотрим в названии и компании:
             # в описаниях «Java», «junior», «Сбер» встречаются мимоходом
             # («будете менторить junior») и отсекали подходящие вакансии.

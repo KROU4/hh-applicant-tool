@@ -495,14 +495,19 @@ def test_keywords_drive_search_and_filter(bot, tmp_path):
 
     args = build_apply_args(bot.state.get("apply"), tmp_path / "letter.txt")
     ns = HHApplicantTool()._parser.parse_args(args)
-    assert ns.search == 'llm OR rag OR "ai engineer"'
+    # Несколько узких запросов вместо одного широкого OR
+    assert ns.search is None
+    assert ns.search_queries
+    assert ns.search_order == "both"
     assert ns.included_filter == "llm|rag|ai[- ]?engineer"
     assert ns.search_field == ["name"]
 
     # Явный поиск важнее автоматического
     bot.state.set("apply", "search", "python")
     args = build_apply_args(bot.state.get("apply"), tmp_path / "letter.txt")
-    assert HHApplicantTool()._parser.parse_args(args).search == "python"
+    ns = HHApplicantTool()._parser.parse_args(args)
+    assert ns.search == "python"
+    assert ns.search_queries is None
 
 
 def test_priority_words_reach_apply(bot, tmp_path):

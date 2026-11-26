@@ -753,3 +753,75 @@ def test_priority_titles_go_first_from_all_sources():
     op.priority_filter = None
     names = [v["name"] for v in op._get_vacancies(resume_id="r1")]
     assert names[:2] == ["Python-разработчик", "LLM Engineer"]
+
+
+def test_parse_search_query_field_prefixes():
+    from hh_applicant_tool.operations.apply_vacancies import parse_search_query
+
+    assert parse_search_query("name:llm OR rag") == ("name", "llm OR rag")
+    assert parse_search_query("desc:python AND ai") == (None, "python AND ai")
+    assert parse_search_query("  llm  ") == (None, "llm")
+
+
+def test_search_queries_are_searched_separately_in_both_orders():
+    op = _make_operation(max_responses=0)
+    op.search = None
+    op.search_queries = [("name", "llm"), ("name", "rag")]
+    op.search_order = "both"
+    op.search_field = ["name"]
+    op.area = None
+    op.priority_area = None
+    op.recommended_first = False
+    op.total_pages = 5
+    calls = []
+
+    def api_get(url, params, *a, **k):
+        calls.append(dict(params))
+        # Одна вакансия в обеих выдачах: должна прийти один раз
+        items = [
+            {"id": "same", "name": "LLM Engineer"},
+            {"id": f"{params['text']}-{params['order_by']}", "name": params["text"]},
+        ]
+        return {"items": items, "found": len(items), "pages": 1}
+
+    op.tool.api_client.get.side_effect = api_get
+    op._get_search_params = lambda page: {"page": page, "per_page": 100}
+    names = [v["name"] for v in op._get_vacancies(resume_id="r1")]
+
+    assert [c["text"] for c in calls] == ["llm", "llm", "rag", "rag"]
+    assert [c["order_by"] for c in calls] == [
+        "relevance",
+        "publication_time",
+        "relevance",
+        "publication_time",
+    ]
+    assert [c["search_field"] for c in calls] == [["name"]] * 4
+    assert names.count("LLM Engineer") == 1
+
+
+def test_local_any_format_keeps_office_vacancies_in_priority_area():
+    op = _make_operation(max_responses=0)
+    op.search = None
+    op.search_queries = [("name", "llm")]
+    op.area = None
+    op.priority_area = ["16"]
+    op.other_areas = "remote"
+    op.local_any_format = True
+    op.recommended_first = False
+    op.total_pages = 1
+    calls = []
+
+    def api_get(url, params, *a, **k):
+        calls.append(dict(params))
+        return {"items": [], "found": 0, "pages": 1}
+
+    op.tool.api_client.get.side_effect = api_get
+    op._get_search_params = lambda page: {
+        "page": page,
+        "work_format": ["REMOTE", "HYBRID"],
+    }
+    list(op._get_vacancies(resume_id="r1"))
+
+    local, remote = calls
+    assert local["area"] == ["16"] and "work_format" not in local
+    assert "area" not in remote and remote["work_format"] == ["REMOTE"]

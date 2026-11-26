@@ -648,6 +648,8 @@ $ hh-applicant-tool settings auth.username 'user@example.com'
 
 > [!IMPORTANT]
 > Почитайте про [язык для поисковых запросов](https://hh.ru/article/1175). Он позволяет отсеивать мусор при поиске подходящих вакансий, например, `(Go OR Golang) NOT PHP NOT JavaScript`.
+>
+> У hh глубина выдачи — 2000 вакансий на запрос, поэтому один широкий OR-запрос быстро упирается в лимит, а его топ занимают нерелевантные вакансии. В `apply-vacancies` можно передать несколько узких запросов (`--search-query "name:llm OR rag"` повторяется) и попросить два прохода выдачи (`--search-order both`: по релевантности и по дате публикации — чтобы не пропустить свежие). Префикс `name:` ищет по названию, `desc:` — по всем полям.
 
 Утилита использует систему плагинов. Все они лежат в [operations](https://github.com/s3rgeym/hh-applicant-tool/tree/main/src/hh_applicant_tool/operations). Модули, расположенные там, автоматически добавляются как доступные команды. За основу для своего плагина можно взять [whoami.py](https://github.com/s3rgeym/hh-applicant-tool/tree/main/src/hh_applicant_tool/operations/whoami.py).
 

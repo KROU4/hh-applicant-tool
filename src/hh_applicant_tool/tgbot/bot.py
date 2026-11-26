@@ -39,6 +39,20 @@ TASK_TITLES = {
 
 AI_FILTERS = [None, "light", "heavy"]
 AI_FILTER_TITLES = {None: "выкл", "light": "быстрый", "heavy": "полный"}
+# Поисковые запросы hh. Один широкий OR-запрос упирается в лимит выдачи hh
+# (2000) и топ занят мусором: «ai» через синонимы находит «Агент по
+# недвижимости», «js» — все Vue.js-вакансии. Поэтому каждый смысловой блок
+# ищется отдельно, а NOT-условия убирают «агентов по продажам», которых hh
+# подмешивает к AI как синоним.
+AI_SEARCH_QUERIES = [
+    'name:(ai OR llm OR genai OR "gen ai" OR "искусственный интеллект" OR нейросети) NOT "агент по" NOT "sales agent" NOT "страховой агент" NOT "для обучения нейросетей" NOT "по обучению нейросетей" NOT "обучению нейросетей"',
+    'name:"machine learning" OR "ml engineer" OR "ml инженер" OR "ml-инженер" OR "ml разработчик" OR mlops OR "deep learning" OR "computer vision" OR nlp OR !ml',
+    'name:llm OR rag OR llmops OR "prompt engineer" OR "промпт-инженер" OR "large language model" OR "generative ai" OR "vibe coding" OR вайбкодер OR "вайб-кодер"',
+    'name:("ai agent" OR "ai agents" OR agentic OR "agent engineer" OR "agentic engineer" OR "ai-агент") NOT "агент по" NOT "sales agent" NOT "real estate" NOT "для обучения нейросетей"',
+    'name:"искусственный интеллект" OR нейросетевой OR "машинное обучение" OR "ии-инженер" OR "ии-разработчик" NOT "для обучения нейросетей" NOT "по обучению нейросетей"',
+    'name:python AND (llm OR rag OR genai OR "machine learning" OR !ai OR !ии OR нейросети OR agentic)',
+    'name:backend AND (llm OR rag OR genai OR "machine learning" OR !ai OR !ии)',
+]
 WORK_FORMATS = [None, "REMOTE", "HYBRID", "REMOTE,HYBRID"]
 # Регион, вакансии из которого идут первыми (area id hh)
 PRIORITY_AREAS = [None, "16", "113", "40"]
@@ -305,11 +319,25 @@ def build_apply_args(settings: dict[str, Any], letter_path: Path) -> list[str]:
         args.append("--dry-run")
     if settings.get("send_email"):
         args.append("--send-email")
-    search = settings.get("search") or regex_to_query(
-        settings.get("included_filter") or ""
+    search = settings.get("search")
+    # Несколько узких запросов вместо одного широкого: так выдача hh не
+    # размывается мусором и новые вакансии не вытесняются из топ-2000
+    multi_query = bool(
+        not search
+        and settings.get("included_filter")
+        and settings.get("search_in_name", True)
     )
     if search:
         args.append(f"--search={search}")
+    elif multi_query:
+        args += ["--search-order", "both"]
+        args += ["--search-field", "name"]
+        for query in AI_SEARCH_QUERIES:
+            args.append(f"--search-query={query}")
+    elif settings.get("included_filter"):
+        query = regex_to_query(settings.get("included_filter") or "")
+        if query:
+            args.append(f"--search={query}")
     if settings.get("included_filter"):
         args.append(
             f"--included-filter={normalize_keywords(settings['included_filter'])}"
@@ -334,7 +362,7 @@ def build_apply_args(settings: dict[str, Any], letter_path: Path) -> list[str]:
         args.append(f"--letter-contact={settings['letter_contact']}")
     if settings.get("work_format"):
         args += ["--work-format", *settings["work_format"].split(",")]
-    if settings.get("search_in_name"):
+    if settings.get("search_in_name") and not multi_query:
         args += ["--search-field", "name"]
     if settings.get("recommended_first"):
         args.append("--recommended-first")
@@ -733,6 +761,12 @@ class HHBot:
 
     def screen_settings(self) -> tuple[str, dict]:
         s = self.state.get("apply")
+        if s["search"]:
+            search_display = s["search"]
+        elif s.get("included_filter") and s.get("search_in_name"):
+            search_display = f"{len(AI_SEARCH_QUERIES)} отдельных запросов"
+        else:
+            search_display = regex_to_query(s.get("included_filter") or "") or "—"
         letter = (
             self.letter_path.read_text(encoding="utf-8")[:200]
             if self.letter_path.exists()
@@ -747,7 +781,7 @@ class HHBot:
             f"⭐ Сначала рекомендации hh: {on_off(s.get('recommended_first'))}",
             f"🗺 Сначала регион: {PRIORITY_AREA_TITLES.get(s.get('priority_area'), s.get('priority_area'))}",
             f"🌐 Другие страны: {OTHER_AREAS_TITLES.get(s.get('other_areas') or 'all')}",
-            f"   запрос в hh: <code>{esc(s['search'] or regex_to_query(s.get('included_filter') or '') or '—')}</code>",
+            f"   запрос в hh: <code>{esc(search_display)}</code>",
             f"🚫 Стоп-слова: {esc(s['excluded_filter']) or '—'}",
             f"⭐ Главные слова (первыми): {esc(s.get('priority_filter') or '—')}",
             f"📄 Резюме: {esc(s['resume_title'] or 'все опубликованные')}",
