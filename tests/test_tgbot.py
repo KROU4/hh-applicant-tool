@@ -495,8 +495,9 @@ def test_keywords_drive_search_and_filter(bot, tmp_path):
 
     args = build_apply_args(bot.state.get("apply"), tmp_path / "letter.txt")
     ns = HHApplicantTool()._parser.parse_args(args)
-    # Несколько узких запросов вместо одного широкого OR
-    assert ns.search is None
+    # Узкие запросы, а после них общий по всем ключевым словам: иначе
+    # вакансии по «python», «backend» из фильтра вообще не искались бы
+    assert ns.search == 'llm OR rag OR "ai engineer"'
     assert ns.search_queries
     assert ns.search_order == "both"
     assert ns.included_filter == "llm|rag|ai[- ]?engineer"

@@ -799,6 +799,61 @@ def test_search_queries_are_searched_separately_in_both_orders():
     assert names.count("LLM Engineer") == 1
 
 
+def test_main_search_runs_after_narrow_queries_at_full_depth():
+    op = _make_operation(max_responses=0)
+    op.search = "python OR backend"
+    op.search_queries = [("name", "llm")]
+    op.search_order = "publication_time"
+    op.search_field = ["name"]
+    op.area = None
+    op.priority_area = None
+    op.recommended_first = False
+    op.total_pages = 4
+    op._all_fields_ids = set()
+    calls = []
+
+    def api_get(url, params, *a, **k):
+        calls.append(dict(params))
+        text, page = params["text"], params["page"]
+        items = [{"id": f"{text}-{page}", "name": f"{text} {page}"}]
+        return {"items": items, "found": 400, "pages": 4}
+
+    op.tool.api_client.get.side_effect = api_get
+    op._get_search_params = lambda page: {"page": page, "per_page": 100}
+    list(op._get_vacancies(resume_id="r1"))
+
+    texts = [c["text"] for c in calls]
+    # Узкий — на первые страницы, общий — на всю глубину --total-pages
+    assert texts == ["llm"] * 3 + ["python OR backend"] * 4
+    # Общий --search-field name: слова ищутся только в названии, описание
+    # (лишний просмотр вакансии и шаг к капче) не открываем
+    assert all(c["search_field"] == ["name"] for c in calls)
+    assert not op._all_fields_ids
+
+
+def test_only_ai_rejections_are_remembered():
+    from hh_applicant_tool.operations.apply_vacancies import AI_REJECTED_REASON
+
+    op = _make_operation(max_responses=0)
+    found = []
+
+    def find(**kwargs):
+        found.append(kwargs)
+        return []
+
+    op.tool.storage.skipped_vacancies.find.side_effect = find
+    assert op._is_vacancy_already_skipped({"id": "1"}, "r1") is False
+    # Пропуск по старым ключевым словам не блокирует вакансию навсегда
+    assert found and all(k["reason"] == AI_REJECTED_REASON for k in found)
+
+
+def test_light_filter_prompt_is_lenient():
+    op = _make_operation(max_responses=0)
+    prompt = op._build_filter_system_prompt_light("Должность: AI Engineer")
+    assert "Если сомневаешься — suitable = true" in prompt
+    assert "Должность: AI Engineer" in prompt
+
+
 def test_local_any_format_keeps_office_vacancies_in_priority_area():
     op = _make_operation(max_responses=0)
     op.search = None

@@ -334,6 +334,12 @@ def build_apply_args(settings: dict[str, Any], letter_path: Path) -> list[str]:
         args += ["--search-field", "name"]
         for query in AI_SEARCH_QUERIES:
             args.append(f"--search-query={query}")
+        # Остальные ключевые слова (Python, backend, fullstack…) — общим
+        # запросом после узких: без него такие вакансии вообще не искались,
+        # хотя фильтр ключевых слов их пропускает
+        query = regex_to_query(settings.get("included_filter") or "")
+        if query:
+            args.append(f"--search={query}")
     elif settings.get("included_filter"):
         query = regex_to_query(settings.get("included_filter") or "")
         if query:
@@ -764,7 +770,9 @@ class HHBot:
         if s["search"]:
             search_display = s["search"]
         elif s.get("included_filter") and s.get("search_in_name"):
-            search_display = f"{len(AI_SEARCH_QUERIES)} отдельных запросов"
+            search_display = (
+                f"{len(AI_SEARCH_QUERIES)} узких запросов + общий по ключевым словам"
+            )
         else:
             search_display = regex_to_query(s.get("included_filter") or "") or "—"
         letter = (

@@ -57,6 +57,8 @@ PAGE_RETRY_DELAY = 10
 SEARCH_QUERY_PAGES = 3
 # Отметка в skipped_vacancies: hh отверг отклик, повторять бессмысленно
 APPLY_FAILED_REASON = "apply_failed"
+# Отметка в skipped_vacancies: AI-фильтр счёл вакансию неподходящей
+AI_REJECTED_REASON = "ai_rejected"
 # Ошибка main.parse_redirect_config, когда сайт видит нас анонимом, и строка
 # для Telegram-бота (он предлагает войти по коду)
 WEB_AUTH_EXPIRED_TEXT = "Авторизация истекла"
@@ -884,8 +886,8 @@ class Operation(BaseOperation):
         )
 
     def _is_vacancy_suitable_light(self, vacancy: dict) -> bool:
-        vacancy_info = self._build_vacancy_context(vacancy, include_full=False)
-        prompt = f"Вакансия: {vacancy_info}"
+        # Контекст уже начинается с «Вакансия: …»
+        prompt = self._build_vacancy_context(vacancy, include_full=False)
         return self._ask_ai_suitability(
             prompt, vacancy.get("name", ""), "(light)"
         )
@@ -919,22 +921,36 @@ class Operation(BaseOperation):
 """
 
     def _build_filter_system_prompt_light(self, resume_analysis: str) -> str:
+        # Вакансии сюда приходят уже отобранными по ключевым и стоп-словам
+        # кандидата. Прежняя версия требовала ещё и совпадения навыков и
+        # отклоняла «ML-инженер», «MLOps Engineer», «Prompt-инженер» у
+        # AI-инженера: у многих вакансий навыков нет или они другие
         return f"""
-Ты делаешь очень грубую проверку: подходит вакансия или нет.
+Ты делаешь грубую проверку: подходит ли вакансия кандидату по роли.
+Вакансии уже отобраны по ключевым словам кандидата. Твоя задача —
+отсеять явно чужую работу, а не искать идеальное совпадение.
 
 Используй только:
-- название резюме
-- список навыков резюме
+- название и навыки резюме
 - название вакансии
-- явно указанные ключевые навыки вакансии
+- ключевые навыки вакансии, если они указаны
 
-Не анализируй описание, обязанности, контекст, домен, уровень, карьерный рост и прочую воду.
-Не додумывай ничего, чего нет в тексте.
+suitable = true, если:
+- вакансия в той же профессии или в соседней специализации той же области
+  (для разработчика — другие инженерные и разработческие роли на его стеке;
+  для AI/LLM-инженера — AI-, ML-, MLOps/LLMOps-, prompt-инженер, разработчик
+  AI-агентов, Python/backend/fullstack-разработка)
+- у кандидата есть хотя бы часть технологий из названия вакансии
+- навыков у вакансии нет или они другие: это не повод отказывать, решай по названию
 
-Правила:
-- если название вакансии и резюме в одной профессии или близких ролях, и есть хотя бы частичное совпадение по ключевым навыкам -> suitable = true
-- если роли явно разные или совпадений по навыкам почти нет -> suitable = false
-- если данных мало -> ориентируйся только на явные совпадения, без фантазий
+suitable = false, только если работа по сути другая:
+- продажи, маркетинг, контент, SMM, дизайн, видео, копирайтинг
+- преподавание, курсы, наставничество, рекрутинг
+- поддержка, операторы, разметка данных, ручная работа без программирования
+- управление без собственной разработки (руководитель направления, product/project manager)
+- основной язык или платформа, которых нет у кандидата (Java, C#, PHP, 1С и т.п.)
+
+Если сомневаешься — suitable = true.
 
 Ответ только JSON:
 {{"suitable": true}} или {{"suitable": false}}
@@ -1235,7 +1251,7 @@ class Operation(BaseOperation):
                         )
 
                         self._save_skipped_vacancy(
-                            vacancy, "ai_rejected", resume["id"]
+                            vacancy, AI_REJECTED_REASON, resume["id"]
                         )
                         continue
 
@@ -1905,12 +1921,25 @@ class Operation(BaseOperation):
             return [order]
         return [None]
 
-    def _queries(self) -> list[tuple[str | None, str]]:
-        if getattr(self, "search_queries", None):
-            return self.search_queries
+    def _queries(self) -> list[tuple[str | None, str, int]]:
+        """Запросы поиска: (поле, текст, сколько страниц смотреть).
+
+        Сначала узкие --search-query (первые страницы), затем основной
+        --search на всю глубину --total-pages: в нём остальные ключевые слова
+        (Python, backend…), и новые вакансии по ним не помещаются в первые
+        страницы выдачи.
+        """
+        query_pages = min(self.total_pages, SEARCH_QUERY_PAGES)
+        queries = [
+            (field, text, query_pages)
+            for field, text in getattr(self, "search_queries", None) or []
+        ]
         if self.search:
-            return [(None, self.search)]
-        return []
+            # Общий --search-field name: проверять слова только в названии
+            fields = getattr(self, "search_field", None) or []
+            field = "name" if "name" in fields else None
+            queries.append((field, self.search, self.total_pages))
+        return queries
 
     def _source_vacancies(
         self, resume_id: str | None = None
@@ -1929,8 +1958,6 @@ class Operation(BaseOperation):
         local_any_format = bool(getattr(self, "local_any_format", False))
         if not hasattr(self, "_all_fields_ids"):
             self._all_fields_ids = set()
-        # Узкие запросы: глубже первых страниц смысла мало, а запросов много
-        query_pages = min(self.total_pages, SEARCH_QUERY_PAGES)
         seen: set[str] = set()
 
         def emit(
@@ -1969,7 +1996,7 @@ class Operation(BaseOperation):
                     similar, overrides, min(self.total_pages, SEARCH_QUERY_PAGES)
                 )
 
-        for field, text in queries:
+        for field, text, query_pages in queries:
             for order in orders:
                 base: dict[str, Any] = {"text": text}
                 if field:
@@ -2272,6 +2299,12 @@ class Operation(BaseOperation):
     def _is_vacancy_already_skipped(
         self, vacancy: SearchVacancy, resume_id: str | None = None
     ) -> bool:
+        """AI-фильтр уже отклонил эту вакансию — повторно не спрашиваем.
+
+        Считаются только отказы AI: пропуски по ключевым и стоп-словам
+        проверяются заново в каждом прогоне. Иначе вакансия, отсеянная
+        старыми ключевыми словами, оставалась бы отклонённой навсегда.
+        """
         try:
             vacancy_id = vacancy["id"]
 
@@ -2280,6 +2313,7 @@ class Operation(BaseOperation):
                     self.tool.storage.skipped_vacancies.find(
                         resume_id=resume_id,
                         vacancy_id=vacancy_id,
+                        reason=AI_REJECTED_REASON,
                     )
                 ):
                     return True
@@ -2288,6 +2322,7 @@ class Operation(BaseOperation):
                 self.tool.storage.skipped_vacancies.find(
                     resume_id="",
                     vacancy_id=vacancy_id,
+                    reason=AI_REJECTED_REASON,
                 )
             )
 
